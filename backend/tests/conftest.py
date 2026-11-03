@@ -1,6 +1,6 @@
 import os
 
-os.environ.setdefault("JWT_SECRET", "test-secret")
+os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret-not-for-production-use")
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 import pytest
