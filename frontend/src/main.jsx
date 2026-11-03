@@ -1,7 +1,5 @@
 import { createRoot } from 'react-dom/client';
 
-function App() {
-  return <h1>Full-Stack starter</h1>;
-}
+import App from './App.jsx';
 
 createRoot(document.getElementById('root')).render(<App />);
