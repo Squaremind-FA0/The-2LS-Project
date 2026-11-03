@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -19,3 +21,20 @@ def get_db() -> Session:
         yield db
     finally:
         db.close()
+
+
+@contextmanager
+def transactional_session():
+    """Yield a Session bound to a connection whose transaction is rolled
+    back on exit, so writes never outlive the caller. Callers must not
+    call session.commit() — that would commit the outer transaction too.
+    """
+    connection = engine.connect()
+    transaction = connection.begin()
+    session = SessionLocal(bind=connection)
+    try:
+        yield session
+    finally:
+        session.close()
+        transaction.rollback()
+        connection.close()

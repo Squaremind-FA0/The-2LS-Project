@@ -29,11 +29,17 @@ if os.path.isdir(_DIST):
     if os.path.isdir(_ASSETS):
         app.mount("/assets", StaticFiles(directory=_ASSETS), name="assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def spa(full_path: str) -> FileResponse:
-        if full_path == "api" or full_path.startswith("api/"):
-            raise HTTPException(status_code=404)
-        candidate = os.path.normpath(os.path.join(_DIST, full_path))
-        if full_path and candidate.startswith(_DIST + os.sep) and os.path.isfile(candidate):
-            return FileResponse(candidate)
-        return FileResponse(os.path.join(_DIST, "index.html"))
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def spa(full_path: str) -> FileResponse:
+    if full_path == "api" or full_path.startswith("api/"):
+        raise HTTPException(status_code=404)
+    if not os.path.isdir(_DIST):
+        raise HTTPException(status_code=404)
+    candidate = os.path.normpath(os.path.join(_DIST, full_path))
+    if full_path and candidate.startswith(_DIST + os.sep) and os.path.isfile(candidate):
+        return FileResponse(candidate)
+    index_path = os.path.join(_DIST, "index.html")
+    if not os.path.isfile(index_path):
+        raise HTTPException(status_code=404)
+    return FileResponse(index_path)
