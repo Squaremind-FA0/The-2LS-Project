@@ -20,4 +20,4 @@ WORKDIR /app/backend
 EXPOSE 8080
 # Dev-only fallback so a bare `docker run` boots; override JWT_SECRET for any real deployment.
 ENV JWT_SECRET=dev-insecure-change-me
-CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8080}"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8080}"]
