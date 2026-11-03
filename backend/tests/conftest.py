@@ -6,8 +6,17 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import transactional_session
+from app.db import engine, transactional_session
 from app.main import app
+from app.models import Base
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _schema():
+    """Create every ORM table once in the shared test database."""
+    Base.metadata.create_all(engine)
+    yield
+    Base.metadata.drop_all(engine)
 
 
 @pytest.fixture
