@@ -19,7 +19,10 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-# API routers. Must stay above the SPA catch-all below so /api/* matches first.
+# API routers — keep every include_router call in this one block, above the
+# SPA catch-all below so /api/* matches first. Every /api/* route outside
+# app.auth.deps.PUBLIC_API_PATHS must depend on require_role(...) and use
+# get_tenant_db; tests/test_route_audit.py enforces that.
 app.include_router(auth.router)
 app.include_router(me.router)
 app.include_router(workers.router)
