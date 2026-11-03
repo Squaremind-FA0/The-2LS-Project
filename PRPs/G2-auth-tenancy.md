@@ -584,3 +584,62 @@ Run `upgrade head` again after `downgrade base` to confirm the round trip.
   nothing else needs to change.
 - **Config:** `JWT_SECRET` env values in deployed environments may stay set
   (harmless) or be removed; `ACCESS_TOKEN_TTL_MIN` disappears with the revert.
+
+## Implementer notes (pre-dispatch, from plan review)
+
+Non-blocking; no re-plan needed. Items marked *verified* were checked with a
+throwaway probe against SQLAlchemy 2.1.6, PyJWT 2.15.1 and pwdlib 0.3.1
+(the versions `pip install -r requirements.txt` resolves today).
+
+1. **Committing routes vs. the transactional fixture.** `login` and
+   `create_worker` commit through the overridden `get_db`, which would commit
+   G1's outer test transaction. Bind the test session with
+   `SessionLocal(bind=connection, join_transaction_mode="create_savepoint")`.
+   *Verified:* on stock pysqlite this is **not enough**. The outer rollback
+   does not undo the savepoint-committed row (1 row left). The engine also
+   needs SQLAlchemy's pysqlite SAVEPOINT recipe: a `connect` listener setting
+   `dbapi_connection.isolation_level = None` and a `begin` listener running
+   `conn.exec_driver_sql("BEGIN")`. With both, the row is gone (0 rows).
+   Apply it only for SQLite URLs in `app/db.py`.
+2. **In-memory SQLite across threads.** `TestClient` runs the app in another
+   thread. `sqlite:///:memory:` with the default pool gives each thread its
+   own empty database. Use `poolclass=StaticPool` for `:memory:` URLs, and
+   check that the test client and fixtures share one connection.
+3. **Migration test URL.** `migrations/env.py` always overwrites
+   `sqlalchemy.url` with `app.config.settings.DATABASE_URL`, which conftest
+   has already set to `:memory:`. For task 9, monkeypatch
+   `app.config.settings.DATABASE_URL`, run alembic in a subprocess with env
+   vars, or have env.py prefer an explicitly supplied URL.
+4. **RED commits.** `prp-implement` step 3c forbids committing a broken
+   state. Confirm RED locally and record it in the task's commit message,
+   then commit test and implementation together. Alternatively, commit the
+   test with `pytest.mark.xfail(strict=True)` and remove the marker in the
+   impl commit. Tasks 19 and 21 may be GREEN on first run. If so, prove each
+   test can fail by temporarily breaking the guard, and note that in the
+   commit message.
+5. **Listener scope.** *Verified:* a listener registered on `SessionLocal` does
+   not fire for a fresh `sessionmaker(...)` (it returned all tenants' rows).
+   Every app and test session must come from `SessionLocal`, or the listener
+   must be registered on the `Session` class. Raw `text()` SQL is never
+   filtered, so keep it out of tenant-scoped code paths.
+6. **Listener recipe.** *Verified:* `do_orm_execute` plus
+   `with_loader_criteria(TenantScoped, lambda c: c.company_id == cid,
+   include_aliases=True)` works:
+   - Filters `select`, `session.get` for another tenant's id (returns `None`),
+     and ORM bulk `update` and `delete` (a cross-tenant delete changed 0 rows).
+   - `any(issubclass(m.class_, TenantScoped) for m in state.all_mappers)`
+     reliably detects tenant statements.
+   - Fails closed with `TenantContextMissing` when there is no context.
+   - Leaves non-tenant entities (`Company`) alone.
+   - `execution_options(skip_tenant_filter=True)` bypasses it.
+7. **pwdlib.** *Verified:* `PasswordHash.recommended()` exists and produces
+   `$argon2id$` hashes. A 100-byte password verifies, and its 72-byte prefix
+   does **not**, so there is no truncation.
+8. **JWT.** *Verified:* `jwt.decode(..., options={"require": ["sub", "tv",
+   "iat", "exp"]})` rejects a token missing `tv` with
+   `MissingRequiredClaimError`. Add `tv` and `iat` to the require list.
+9. **Smaller decisions:**
+   - Use plain `str` for email, stripped and lower-cased
+     (`email-validator` is not a dependency).
+   - Use `extra="forbid"` on request schemas, so a smuggled `company_id`
+     returns 422.
