@@ -11,6 +11,12 @@
 
 ## Run
 
+The backend refuses to start without `JWT_SECRET` (at least 32 bytes). Set it
+in the environment or in an untracked `backend/.env` (gitignored; copy
+`backend/.env.example`), e.g. generate one with
+`python -c 'import secrets;print(secrets.token_urlsafe(48))'`. Never commit
+a real value.
+
 ```bash
 # backend (http://localhost:8000)
 cd backend && pip install -r requirements.txt && uvicorn main:app --reload
@@ -27,6 +33,8 @@ docker build -t app . && docker run -p 8080:8080 app
 ```bash
 cd backend && pytest -q
 cd backend && ruff check .
+cd backend && alembic upgrade head      # needs JWT_SECRET; use a scratch DATABASE_URL
+cd backend && alembic downgrade base    # then upgrade head again to prove the round trip
 cd frontend && npm run build
 cd frontend && npm test        # once a frontend test runner is added
 ```
