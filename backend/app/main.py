@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
+from app.routers import auth
 
 app = FastAPI(title="API")
 app.add_middleware(
@@ -16,6 +17,10 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# API routers. Must stay above the SPA catch-all below so /api/* matches first.
+app.include_router(auth.router)
 
 
 # Single-origin production: when the built frontend exists (docker image or
