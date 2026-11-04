@@ -8,13 +8,17 @@ from sqlalchemy.pool import StaticPool
 from app.config import settings
 from app.tenancy import install_tenant_listeners
 
+SQLITE_BUSY_TIMEOUT_S = 10
+
 
 def _build_engine(url: str):
     parsed = make_url(url)
     if parsed.get_backend_name() != "sqlite":
         return create_engine(url)
 
-    kwargs = {"connect_args": {"check_same_thread": False}}
+    # timeout: wait up to 10s for a competing writer's lock (busy_timeout)
+    # instead of failing immediately with "database is locked".
+    kwargs = {"connect_args": {"check_same_thread": False, "timeout": SQLITE_BUSY_TIMEOUT_S}}
     if parsed.database in (None, "", ":memory:"):
         # An in-memory database exists per connection; share one connection
         # across threads (e.g. TestClient) or each thread sees an empty DB.
@@ -28,10 +32,20 @@ def _build_engine(url: str):
     @event.listens_for(sqlite_engine, "connect")
     def _disable_pysqlite_begin(dbapi_connection, connection_record):
         dbapi_connection.isolation_level = None
+        # WAL lets readers proceed while one writer commits. In-memory
+        # databases ignore it (journal_mode stays "memory").
+        dbapi_connection.execute("PRAGMA journal_mode=WAL")
 
+    # BEGIN IMMEDIATE takes SQLite's single write lock at transaction start.
+    # A deferred BEGIN that reads first and writes later (every request:
+    # auth lookup, then INSERT/UPDATE) cannot upgrade its lock while another
+    # writer holds it; SQLite then returns SQLITE_BUSY at once, ignoring
+    # busy_timeout, which surfaced as a 500. Taking the lock up front makes
+    # concurrent requests queue on busy_timeout instead, so conditional
+    # UPDATEs and unique constraints decide races (409), never lock errors.
     @event.listens_for(sqlite_engine, "begin")
     def _emit_begin(conn):
-        conn.exec_driver_sql("BEGIN")
+        conn.exec_driver_sql("BEGIN IMMEDIATE")
 
     return sqlite_engine
 
