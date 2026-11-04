@@ -32,6 +32,8 @@ Job (inherits TenantScoped):
   lng: float (longitude, required)
   scheduled_for: datetime (when the job starts)
   status: str (draft | offering | assigned | in_progress | completed | cancelled | unfilled)
+  assigned_worker_id: int, FK users.id, nullable (links job to accepted worker; set on first accept)
+  offer_round: int, default=0 (tracks re-offer rounds for bounded sweeper)
   created_at: datetime, server_default=now()
   updated_at: datetime, onupdate=now()
 
@@ -63,6 +65,8 @@ worker_locations(worker_id)      -- lookup by worker (for location refresh)
 worker_locations(lat, lng)       -- **spatial query **; see note below
 job_offers(job_id)               -- find all offers for a job (count accepted)
 job_offers(worker_id, status)    -- find worker's pending offers
+job_offers(status, expires_at)   -- for sweeper to find expired offers efficiently
+UNIQUE job_offers(job_id, worker_id) -- prevent duplicate offers to same worker for same job
 ```
 
 **Spatial note**: SQLite has no spatial index (no R-tree unless compiled in). The dispatch service will use a bounding-box prefilter (fast, indexed, coarse) followed by haversine distance in application code (precise, fine-grained sort). The bounding-box query relies on simple `lat BETWEEN ? AND ?` and `lng BETWEEN ? AND ?` on indexed columns.
@@ -93,7 +97,8 @@ PUT /api/workers/me/location
 POST /api/offers/{offer_id}/accept
   dependencies: [Depends(require_role(Role.worker))]
   response: 200 { id, job_id, worker_id, status: "accepted", ... } on success
-           409 { detail: "Offer already accepted by another worker" } if job already assigned
+           404 { detail: "Offer not found" } if offer does not exist or belongs to another worker
+           409 { detail: "Job already assigned" } if another worker accepted the job first
            410 { detail: "Offer expired" } if past expires_at
 
 POST /api/offers/{offer_id}/decline
@@ -105,19 +110,22 @@ POST /api/offers/{offer_id}/decline
 
 ### Phase 1: Foundation — Database schema + SQLite concurrency fix
 
-1. **tests/test_dispatch.py** — write failing tests for the SQLite concurrency fix:
-   - Test "SQLite: concurrent writes under load" — fire ~10 parallel POST requests to an endpoint that commits writes; verify none raise 500 (i.e., catch OperationalError or see proper 409/200).
-   - Test "Location update race: no missed updates" — ~5 concurrent PUT /api/workers/me/location on same worker; verify all see the updated location.
+1. **tests/test_dispatch.py** — write failing tests for the SQLite concurrency fix, using a file-based SQLite fixture (not StaticPool):
+   - Create a new fixture `db_file_based` that uses `sqlite:////tmp/<random>.db` with WAL and real commits (not SAVEPOINT), yielding sessions that see parallel writes.
+   - Test "SQLite: concurrent writes under load" — fire ~10 parallel POST /api/workers requests (worker creation writes); verify none raise 500 (i.e., no uncaught OperationalError), and all return 200/409.
+   - Test "Location update race: no missed updates" — ~5 concurrent POST /api/workers requests creating workers with the same email; verify exactly one succeeds (200) and the rest fail (409 conflict), and the database reflects only one worker.
 
 2. **backend/app/db.py** — fix SQLite concurrency gap:
    - Add `timeout=10` to connect_args on line 17 (allows SQLite to wait for lock release).
    - Add a connect listener (after line 30) to emit `PRAGMA journal_mode=WAL` (write-ahead logging reduces contention).
+   - Consider wrapping write operations with `BEGIN IMMEDIATE` or catching `sqlite3.OperationalError("database is locked")` in accept/decline handlers and returning 409.
    - Verify the tests from (1) pass (all requests return 200/409, never 500).
 
-3. **backend/alembic/versions/<timestamp>_init_jobs_and_offers.py** — create migration:
-   - Create tables: jobs, worker_locations, job_offers (all inherit TenantScoped; see schema above).
-   - Create indexes: jobs(company_id, status), jobs(company_id, scheduled_for), worker_locations(worker_id), worker_locations(lat, lng), job_offers(job_id), job_offers(worker_id, status).
-   - Verify alembic upgrade head && alembic downgrade base && alembic upgrade head round-trips cleanly.
+3. **backend/migrations/versions/0003_jobs_dispatch.py** — create migration:
+   - Create tables: jobs, worker_locations, job_offers (all inherit TenantScoped; see schema above, including Job.assigned_worker_id FK and Job.offer_round).
+   - Create indexes: jobs(company_id, status), jobs(company_id, scheduled_for), worker_locations(worker_id), worker_locations(lat, lng), job_offers(job_id), job_offers(worker_id, status), job_offers(status, expires_at).
+   - Create UNIQUE constraint: job_offers(job_id, worker_id).
+   - Verify alembic upgrade head && alembic downgrade 0002_auth_tenancy && alembic upgrade head round-trips cleanly.
 
 ### Phase 2: Models + schemas
 
@@ -141,15 +149,16 @@ POST /api/offers/{offer_id}/decline
    - Test "Stale location excluded" — set location.updated_at to 1 hour ago; verify not returned (freshness cutoff TBD per config, suggest 5 minutes).
 
 10. **backend/app/services/dispatch.py** (new file) — implement matching service:
-    - `find_nearby_workers(db: Session, job: Job, max_distance_km: float = 10.0, max_staleness_minutes: float = 5.0) -> list[User]` — returns active workers in job's company, with trade matching job's trade, location fresher than max_staleness_minutes, and distance ≤ max_distance_km, sorted by distance ascending.
+    - `find_nearby_workers(db: Session, job: Job, max_distance_km: float = 10.0, max_staleness_minutes: float = 5.0) -> list[User]` — returns active workers in job's company, with trade matching job's trade, location fresher than max_staleness_minutes (5 min default), and distance ≤ max_distance_km, sorted by distance ascending.
+    - Exclude inactive workers (User.is_active == True, WorkerProfile.active == True) and workers already offered this job.
     - Use SQLAlchemy to join Job, WorkerLocation, WorkerProfile, User.
     - Prefilter with bounding-box `lat BETWEEN ? AND ?` and `lng BETWEEN ? AND ?` (computed from max_distance_km and job's center).
     - Calculate haversine distance in Python per returned row, verify ≤ max_distance_km, sort.
 
 ### Phase 4: Offer flow
 
-11. **tests/test_dispatch.py** — write failing test for double-accept race:
-    - Test "Concurrent double-accept: one wins, one gets 409" — create a job, create one offer, fire 2 parallel POST /api/offers/{id}/accept requests on the same offer simultaneously; verify one returns 200 and one returns 409 (never both 200, never 500, never a silent no-op). Verify the job status transitions to assigned only once.
+11. **tests/test_dispatch.py** — write failing test for double-accept race across a ring:
+    - Test "Concurrent ring double-accept: one wins, one gets 409" — create a job, dispatch offers to workers 1 and 2 (both pending); fire 2 parallel POST /api/offers/{offer_for_worker_1}/accept and POST /api/offers/{offer_for_worker_2}/accept simultaneously (different offers, different workers); verify one returns 200 and one returns 409 (never both 200, never 500). Verify job.status='assigned', job.assigned_worker_id is set to the winner's id, and the loser's offer is marked 'expired'. Verify that the job can no longer be offered to other workers (it is assigned).
 
 12. **backend/app/routers/jobs.py** (new file) — define job CRUD routes:
     - `POST /api/jobs` (dispatcher only) — create and insert a Job in draft status; return JobOut.
@@ -161,42 +170,76 @@ POST /api/offers/{offer_id}/decline
     - `POST /api/offers/{offer_id}/accept` (worker only) — conditionally update offer.status from pending → accepted and job.status → assigned using a race-safe UPDATE with WHERE clause (see race safety note below).
     - `POST /api/offers/{offer_id}/decline` (worker only) — update offer.status pending → declined; trigger sweeper to offer to next worker.
 
-14. **Race-safety in accept**: Use SQLAlchemy's `update()` with explicit WHERE conditions, check `result.rowcount`:
+14. **Race-safety in accept**: Use SQLAlchemy's `update()` with explicit WHERE conditions on BOTH JobOffer and Job, check `result.rowcount`:
     ```python
-    stmt = (
-        update(JobOffer)
-        .where(JobOffer.id == offer_id)
-        .where(JobOffer.status == "pending")
-        .values(status="accepted")
+    # Step 1: Check ownership + expiry (not in WHERE to avoid IDOR on nonexistent offers)
+    offer = db.query(JobOffer).filter(JobOffer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    if offer.worker_id != current_user.id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)  # IDOR: hide existence
+    if offer.expires_at < func.now():
+        raise HTTPException(status.HTTP_410_GONE, detail="Offer expired")
+    
+    # Step 2: Atomic job-level conditional UPDATE (race guard)
+    job_stmt = (
+        update(Job)
+        .where(Job.id == offer.job_id)
+        .where(Job.status == "offering")
+        .where(Job.assigned_worker_id == None)
+        .values(status="assigned", assigned_worker_id=current_user.id)
     )
-    result = db.execute(stmt)
-    db.commit()
-    if result.rowcount == 0:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="Offer not pending")
+    job_result = db.execute(job_stmt)
+    
+    # Step 3: If job update succeeded, mark offer as accepted and expire other offers
+    if job_result.rowcount == 1:
+        offer_stmt = (
+            update(JobOffer)
+            .where(JobOffer.id == offer_id)
+            .values(status="accepted")
+        )
+        db.execute(offer_stmt)
+        # Expire other pending offers for this job
+        expire_stmt = (
+            update(JobOffer)
+            .where(JobOffer.job_id == offer.job_id)
+            .where(JobOffer.id != offer_id)
+            .where(JobOffer.status == "pending")
+            .values(status="expired")
+        )
+        db.execute(expire_stmt)
+        db.commit()
+        return offer  # 200 OK
+    else:
+        # Another worker already accepted this job
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="Job already assigned")
     ```
-    This ensures exactly one request sees rowcount > 0; the other sees 0 and returns 409.
+    This ensures exactly one worker sets assigned_worker_id; all others see 409.
 
 ### Phase 5: Expiry + sweeper
 
 15. **tests/test_dispatch.py** — write failing tests for expiry and sweeper:
-    - Test "Expired offer cannot be accepted" — create offer with expires_at in the past; attempt POST /api/offers/{id}/accept; verify 410 or 409 (document which and rationale: suggest 409 "offer no longer pending" for uniformity).
-    - Test "Decline triggers next offer" — create job, create offers to workers 1, 2, 3 (by distance); decline worker 1's offer; verify an offer is created for worker 2 (or verify the new offer exists, or verify job still has status offering).
+    - Test "Expired offer cannot be accepted" — create offer with expires_at in the past; attempt POST /api/offers/{id}/accept; verify 410 Offer expired (matches API contract on line 97).
+    - Test "Decline triggers next offer" — create job in company with 3 workers at increasing distance; dispatch offers (ring size=3); decline the nearest worker's offer; verify a new offer is created for the second-nearest worker and job status is still "offering".
 
 16. **backend/app/services/dispatch.py** — add sweeper helpers:
-    - `check_offer_expiry(db: Session) -> list[int]` — mark all JobOffers past expires_at as expired; return the job_ids.
-    - `re_offer_job(db: Session, job: Job, ring_size: int = 10, max_rounds: int = 5) -> bool` — find next ring of workers (workers not yet offered in this job), create offers, update job.status to "offering"; return True if offers created, False if no workers left (mark job "unfilled", mark it done).
+    - `check_offer_expiry(db: Session, company_id: int) -> list[int]` — for the given company, mark all JobOffers past expires_at as expired; return the list of job_ids that now have no pending offers (used to trigger re-offer).
+    - `re_offer_job(db: Session, job: Job, ring_size: int = 10, max_rounds: int = 5) -> bool` — for a job with no pending offers, find the next ring of workers (workers not yet offered in this job at any round), create new offers, increment job.offer_round. If offer_round >= max_rounds or no new workers found, mark job "unfilled" and return False. Return True if offers were created.
 
-17. **backend/app/routers/jobs.py or dispatch.py** — add a bounded sweeper task:
-    - Define an async endpoint or background task `POST /api/dispatch/sweep` (admin only, or internal-only) or a scheduled task via a third-party queue (Celery, etc.).
-    - Call check_offer_expiry, then re_offer_job for each expired offer's job.
-    - If no workers left after max_rounds, mark job "unfilled" and mark the job as terminal.
+17. **backend/app/routers/dispatch.py** — add a bounded sweeper task:
+    - Define endpoint `POST /api/dispatch/sweep` (admin only, scoped to current company via get_tenant_db).
+    - Call check_offer_expiry(db, company_id) to mark all expired offers.
+    - For each job returned by check_offer_expiry, call re_offer_job(db, job) to create next ring of offers.
+    - re_offer_job respects max_rounds: if job.offer_round >= max_rounds or no new workers found, mark job "unfilled".
+    - Return summary: { expired_count, rejobs_count, unfilled_count }.
     - This is **NOT** a background daemon — it's a bounded, explicit step triggered by a cron or admin request (to ensure it's not an unbounded retry loop).
 
 ### Phase 6: Router integration + validation
 
-18. **backend/main.py** — register the new routers:
+18. **backend/app/main.py** — register the new routers (in the include_router block around line 26-28):
     - `app.include_router(jobs_router)` (after workers_router).
-    - `app.include_router(dispatch_router)`.
+    - `app.include_router(dispatch_router)` (after jobs_router).
 
 19. **tests/test_route_audit.py** (existing) — verify new routes:
     - Ensure POST/GET/PATCH /api/jobs/* require role.
@@ -205,21 +248,24 @@ POST /api/offers/{offer_id}/decline
     - The existing route_audit test enforces these (already extends on all /api routes), so this is a verification step, not new code.
 
 20. **tests/test_dispatch.py** — integration tests:
-    - "E2E job dispatch flow": create company, 2 workers, a job; verify offers created to both; worker 1 accepts (200); worker 2 attempts accept (409); job status is "assigned"; verify worker 1 is linked.
+    - "E2E job dispatch flow": create company, 2 workers at different distances, a job; verify offers created to both; worker 1 accepts (200); worker 2 attempts accept (409); verify job status='assigned', job.assigned_worker_id=worker_1.id, worker_2's offer status='expired'.
     - All 5 acceptance criteria tests (see Acceptance Criteria section) — each maps to one or more tasks above.
+
+**Note on task ordering**: Tasks are listed in dependency order. Task 3 (migration) comes before Tasks 4-6 (models) so that alembic autogenerate can generate from the models. If writing the migration by hand, models can be created first or in parallel.
 
 ## Validation gates
 
 ```bash
 cd backend && pytest -q
 cd backend && ruff check .
-cd backend && alembic upgrade head
-cd backend && alembic downgrade base
-cd backend && alembic upgrade head
+cd backend && JWT_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))') DATABASE_URL=sqlite:////tmp/test.db alembic upgrade head
+cd backend && JWT_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))') DATABASE_URL=sqlite:////tmp/test.db alembic downgrade 0002_auth_tenancy
+cd backend && JWT_SECRET=$(python -c 'import secrets;print(secrets.token_urlsafe(48))') DATABASE_URL=sqlite:////tmp/test.db alembic upgrade head
 cd frontend && npm run build
+cd frontend && npm test
 ```
 
-These are copied from CLAUDE.md and represent the project-wide validation standard. Run these after every task.
+These are based on CLAUDE.md and represent the project-wide validation standard. The alembic gates require JWT_SECRET (32+ bytes) and a scratch DATABASE_URL. Run these after every task.
 
 ## Acceptance criteria
 
@@ -235,9 +281,9 @@ These are copied from CLAUDE.md and represent the project-wide validation standa
 
 6. ✅ **Double-accept race safety**: concurrent POST /api/offers/{id}/accept on the same offer yields exactly one 200 and one 409 (never both 200, never 500). Verified by regression test firing 2+ parallel requests simultaneously.
 
-7. ✅ **Offer state machine**: JobOffer status transitions pending → accepted | declined | expired. Accept is idempotent (retrying with same worker returns 200 if already accepted, 409 if already taken). Decline marks as declined and triggers next offer.
+7. ✅ **Offer state machine**: JobOffer status transitions pending → accepted | declined | expired. Accept across a ring of offers is race-safe: exactly one worker wins (200) and others get 409 with the loser's offer marked expired. Decline marks as declined and triggers next offer.
 
-8. ✅ **Expiry enforcement**: offers past expires_at cannot be accepted (return 409 or 410, whichever is documented; suggest 409 for uniformity). Sweeper marks them expired and re-offers to next ring.
+8. ✅ **Expiry enforcement**: offers past expires_at cannot be accepted, returning 410 (not 409). Sweeper marks them expired and re-offers to next ring.
 
 9. ✅ **Bounded sweeper**: re_offer_job stops after max_rounds (default 5); if no workers left, job marked "unfilled". No unbounded retry loop. The sweeper endpoint is explicit (POST /api/dispatch/sweep) and not a background daemon.
 
@@ -267,15 +313,15 @@ These are copied from CLAUDE.md and represent the project-wide validation standa
 
 1. **Spatial performance**: Without an R-tree index, bounding-box queries on 100k+ locations may be slow. Mitigation: keep location data pruned (e.g., delete stale entries older than 24h in a background task). If perf becomes a bottleneck, post-G3 work could add a spatial library (PostGIS if Postgres is available, or an in-process spatial cache).
 
-2. **Sweeper unboundedness**: if a re_offer fails (e.g., database error mid-loop), the loop might retry forever. Mitigation: explicit max_rounds limit, explicit error handling (log and skip the job if an error occurs mid-sweep), and no automatic retry — only explicit endpoint calls.
+2. **Sweeper unboundedness and re-offer semantics**: re_offer_job only fires when a job has no pending offers (all declined, expired, or one was accepted and others marked expired). Re-offering happens only by calling re_offer_job explicitly, never automatically. If a re_offer fails (e.g., database error), the job stays in "offering" status and the sweeper must be called again. Mitigation: explicit max_rounds limit, explicit error handling (log and skip the job if an error occurs mid-sweep), and no automatic retry — only explicit endpoint calls.
 
 3. **Clock skew**: expires_at comparison relies on server clock. If clocks skew between app replicas, offers may expire early or late. Mitigation: all servers use NTP; compare against server time in the app, not client time.
 
-4. **Race condition in double-accept**: two workers accepting the same offer simultaneously must have exactly one winner. Mitigation: conditional UPDATE with WHERE status='pending', check rowcount. Test verifies this with parallel requests. SQLite's SERIALIZABLE isolation (the default) ensures the WHERE clause is atomic; if moving to Postgres in future, explicitly set isolation_level to SERIALIZABLE.
+4. **Race condition in double-accept across a ring**: two workers accepting distinct pending offers for the same job simultaneously must have exactly one winner. Mitigation: conditional UPDATE on Job with WHERE status='offering' AND assigned_worker_id=NULL, check rowcount. Test verifies this with parallel requests on different offers. SQLite's default isolation level (SERIALIZABLE) and Postgres READ COMMITTED both ensure the WHERE clause is re-checked atomically on the locked row, so no explicit SERIALIZABLE isolation is required.
 
 ## Rollback
 
-1. **Branch deletion**: `git branch -D prp/G3` (if not yet merged).
-2. **Migration revert**: `alembic downgrade base` (rolls back the jobs/worker_locations/job_offers tables).
-3. **Route deregistration**: remove `app.include_router(jobs_router)` and `app.include_router(dispatch_router)` from main.py.
-4. **Database state**: if jobs were created in production before rollback, they will orphaned tables; recommend a pre-rollback purge query to delete all job/offer rows, or leave them (they won't be queried post-rollback).
+1. **Branch deletion**: `git branch -D prp/G3` (if not yet merged). **Requires human approval** (destructive operation).
+2. **Migration revert**: `alembic downgrade 0002_auth_tenancy` (rolls back only the G3 jobs/worker_locations/job_offers tables, preserving G1/G2 tables).
+3. **Route deregistration**: remove `app.include_router(jobs_router)` and `app.include_router(dispatch_router)` from backend/app/main.py.
+4. **Database state**: if jobs were created in production before rollback, they will be in orphaned tables; recommend a pre-rollback purge query to delete all job/offer rows before downgrading, or leave them (they won't be queried post-rollback).
