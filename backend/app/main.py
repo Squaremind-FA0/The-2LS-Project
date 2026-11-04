@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.routers import auth, me, workers
+from app.routers import auth, dispatch, jobs, me, workers
 
 app = FastAPI(title="API")
 app.add_middleware(
@@ -26,6 +26,8 @@ def health() -> dict:
 app.include_router(auth.router)
 app.include_router(me.router)
 app.include_router(workers.router)
+app.include_router(jobs.router)
+app.include_router(dispatch.router)
 
 
 # Single-origin production: when the built frontend exists (docker image or

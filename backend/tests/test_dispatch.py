@@ -301,3 +301,350 @@ def test_workers_already_offered_this_job_excluded(transactional_db, two_compani
         transactional_db.flush()
 
     assert match_ids(transactional_db, a.id, job_id) == [other.id]
+
+
+# --- Phase 4: jobs API, location, offer flow (tasks 11-14) ---------------------------------
+
+
+def job_body(**overrides) -> dict:
+    body = {
+        "trade": "plumbing",
+        "address": "1 George St, Sydney",
+        "lat": JOB_LAT,
+        "lng": JOB_LNG,
+        "scheduled_for": "2026-12-01T09:00:00Z",
+    }
+    body.update(overrides)
+    return body
+
+
+def fresh(db, company_id, model, ident):
+    with tenant_context(db, company_id):
+        db.expire_all()
+        return db.get(model, ident)
+
+
+def offers_for(db, company_id, job_id) -> dict[int, JobOffer]:
+    with tenant_context(db, company_id):
+        db.expire_all()
+        rows = db.scalars(select(JobOffer).where(JobOffer.job_id == job_id)).all()
+        return {o.worker_id: o for o in rows}
+
+
+def start_offering(client, dispatcher, job_id):
+    return client.patch(
+        f"/api/jobs/{job_id}", json={"status": "offering"}, headers=auth_header(dispatcher)
+    )
+
+
+def test_dispatcher_creates_draft_job(client, two_companies, transactional_db):
+    a, _ = two_companies
+    response = client.post("/api/jobs", json=job_body(trade=" Plumbing "),
+                           headers=auth_header(a.dispatcher))
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "draft"
+    assert body["trade"] == "plumbing"
+    assert body["scheduled_for"].startswith("2026-12-01T09:00:00")
+    assert body["assigned_worker_id"] is None
+    assert fresh(transactional_db, a.id, Job, body["id"]).company_id == a.id
+
+
+@pytest.mark.parametrize("role", ["worker", "admin"])
+def test_only_dispatcher_creates_jobs(client, two_companies, role):
+    a, _ = two_companies
+    response = client.post("/api/jobs", json=job_body(), headers=auth_header(getattr(a, role)))
+    assert response.status_code == 403
+
+
+def test_create_job_rejects_smuggled_fields_and_bad_coordinates(client, two_companies):
+    a, b = two_companies
+    headers = auth_header(a.dispatcher)
+    assert client.post("/api/jobs", json=job_body(company_id=b.id),
+                       headers=headers).status_code == 422
+    assert client.post("/api/jobs", json=job_body(status="assigned"),
+                       headers=headers).status_code == 422
+    assert client.post("/api/jobs", json=job_body(lat=91), headers=headers).status_code == 422
+    assert client.post("/api/jobs", json=job_body(lng=-181), headers=headers).status_code == 422
+
+
+def test_list_jobs_is_company_scoped_and_filterable(client, two_companies, transactional_db):
+    a, b = two_companies
+    draft = add_job(transactional_db, a.id)
+    offering = add_job(transactional_db, a.id, status=JobStatus.offering)
+    add_job(transactional_db, b.id)
+
+    for staff in (a.dispatcher, a.admin):
+        listed = client.get("/api/jobs", headers=auth_header(staff))
+        assert listed.status_code == 200
+        assert [j["id"] for j in listed.json()] == [draft, offering]
+    only = client.get("/api/jobs?status=offering", headers=auth_header(a.dispatcher)).json()
+    assert [j["id"] for j in only] == [offering]
+    page = client.get("/api/jobs?limit=1&offset=1", headers=auth_header(a.dispatcher)).json()
+    assert [j["id"] for j in page] == [offering]
+    assert client.get("/api/jobs", headers=auth_header(a.worker)).status_code == 403
+    assert client.get("/api/jobs?limit=0", headers=auth_header(a.admin)).status_code == 422
+
+
+def test_offering_transition_offers_nearest_ring(client, two_companies, transactional_db,
+                                                 monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 2)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    add_worker(transactional_db, a.id, "w3", 3.0)
+    job_id = add_job(transactional_db, a.id)
+
+    response = start_offering(client, a.dispatcher, job_id)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "offering"
+    assert response.json()["offer_round"] == 1
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert set(offers) == {w1.id, w2.id}
+    now = utcnow()
+    for offer in offers.values():
+        assert offer.status is OfferStatus.pending
+        assert now < offer.expires_at <= now + timedelta(seconds=settings.DISPATCH_OFFER_TTL_S)
+
+
+@pytest.mark.parametrize(
+    ("start", "target"),
+    [
+        (JobStatus.draft, "draft"),
+        (JobStatus.offering, "offering"),
+        (JobStatus.offering, "draft"),
+        (JobStatus.cancelled, "offering"),
+        (JobStatus.assigned, "cancelled"),
+        (JobStatus.unfilled, "offering"),
+    ],
+)
+def test_invalid_transitions_are_400(client, two_companies, transactional_db, start, target):
+    a, _ = two_companies
+    job_id = add_job(transactional_db, a.id, status=start)
+    response = client.patch(f"/api/jobs/{job_id}", json={"status": target},
+                            headers=auth_header(a.dispatcher))
+    assert response.status_code == 400
+    assert fresh(transactional_db, a.id, Job, job_id).status is start
+
+
+def test_patch_job_of_other_company_is_404(client, two_companies, transactional_db):
+    a, b = two_companies
+    job_id = add_job(transactional_db, b.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 404
+    assert fresh(transactional_db, b.id, Job, job_id).status is JobStatus.draft
+
+
+def test_cancel_offering_job_expires_pending_offers(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+
+    response = client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"},
+                            headers=auth_header(a.dispatcher))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert offers_for(transactional_db, a.id, job_id)[w1.id].status is OfferStatus.expired
+    later = client.post(f"/api/offers/{offers_for(transactional_db, a.id, job_id)[w1.id].id}"
+                        "/accept", headers=auth_header(w1))
+    assert later.status_code in (409, 410)
+
+
+def test_worker_location_upsert(client, two_companies, transactional_db):
+    a, _ = two_companies
+    headers = auth_header(a.worker)
+
+    first = client.put("/api/workers/me/location", json={"lat": 1.5, "lng": 2.5},
+                       headers=headers)
+    second = client.put("/api/workers/me/location", json={"lat": -3.25, "lng": 4.0},
+                        headers=headers)
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert second.json()["worker_id"] == a.worker.id
+    assert (second.json()["lat"], second.json()["lng"]) == (-3.25, 4.0)
+    with tenant_context(transactional_db, a.id):
+        rows = transactional_db.scalars(
+            select(WorkerLocation).where(WorkerLocation.worker_id == a.worker.id)
+        ).all()
+    assert len(rows) == 1 and rows[0].company_id == a.id
+
+
+def test_worker_location_rejects_non_workers_and_bad_coordinates(client, two_companies):
+    a, _ = two_companies
+    body = {"lat": 1.0, "lng": 2.0}
+    assert client.put("/api/workers/me/location", json=body,
+                      headers=auth_header(a.dispatcher)).status_code == 403
+    assert client.put("/api/workers/me/location", json={"lat": 90.5, "lng": 0},
+                      headers=auth_header(a.worker)).status_code == 422
+    assert client.put("/api/workers/me/location", json={**body, "worker_id": 999},
+                      headers=auth_header(a.worker)).status_code == 422
+
+
+def test_accept_assigns_job_and_expires_rest_of_ring(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offers = offers_for(transactional_db, a.id, job_id)
+
+    won = client.post(f"/api/offers/{offers[w2.id].id}/accept", headers=auth_header(w2))
+    lost = client.post(f"/api/offers/{offers[w1.id].id}/accept", headers=auth_header(w1))
+
+    assert won.status_code == 200
+    assert won.json()["status"] == "accepted" and won.json()["worker_id"] == w2.id
+    assert lost.status_code == 409
+    assert lost.json()["detail"] == "Job already assigned"
+    job = fresh(transactional_db, a.id, Job, job_id)
+    assert job.status is JobStatus.assigned and job.assigned_worker_id == w2.id
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert offers[w2.id].status is OfferStatus.accepted
+    assert offers[w1.id].status is OfferStatus.expired
+
+
+def test_accepting_twice_is_409(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    offer_id = offers_for(transactional_db, a.id, job_id)[w1.id].id
+
+    assert client.post(f"/api/offers/{offer_id}/accept", headers=auth_header(w1)).is_success
+    assert client.post(f"/api/offers/{offer_id}/accept",
+                       headers=auth_header(w1)).status_code == 409
+
+
+def test_offer_of_another_worker_or_company_is_404(client, two_companies, transactional_db):
+    a, b = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    offer_id = offers_for(transactional_db, a.id, job_id)[w1.id].id
+
+    for intruder in (w2, b.worker):
+        for action in ("accept", "decline"):
+            response = client.post(f"/api/offers/{offer_id}/{action}",
+                                   headers=auth_header(intruder))
+            assert response.status_code == 404
+            assert response.json()["detail"] == "Offer not found"
+    assert client.post("/api/offers/999999/accept", headers=auth_header(w1)).status_code == 404
+    assert client.post(f"/api/offers/{offer_id}/accept",
+                       headers=auth_header(a.dispatcher)).status_code == 403
+    assert offers_for(transactional_db, a.id, job_id)[w1.id].status is OfferStatus.pending
+
+
+def test_accept_guard_holds_without_application_prechecks(
+    client, two_companies, transactional_db, monkeypatch
+):
+    # Simulates the race window: both workers passed the read-side checks
+    # before either wrote. Only the conditional UPDATE can stop the second.
+    monkeypatch.setattr(dispatch, "_refuse_unavailable", lambda *args: None)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    offers = offers_for(transactional_db, a.id, job_id)
+
+    assert client.post(f"/api/offers/{offers[w1.id].id}/accept",
+                       headers=auth_header(w1)).status_code == 200
+    second = client.post(f"/api/offers/{offers[w2.id].id}/accept", headers=auth_header(w2))
+
+    assert second.status_code == 409
+    assert fresh(transactional_db, a.id, Job, job_id).assigned_worker_id == w1.id
+    assert offers_for(transactional_db, a.id, job_id)[w2.id].status is OfferStatus.expired
+
+
+def test_db_rejects_second_accepted_offer_for_a_job(transactional_db, two_companies):
+    from sqlalchemy.exc import IntegrityError
+
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1")
+    w2 = add_worker(transactional_db, a.id, "w2")
+    job_id = add_job(transactional_db, a.id, status=JobStatus.offering)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.add(JobOffer(job_id=job_id, worker_id=w1.id,
+                                      status=OfferStatus.accepted, expires_at=utcnow()))
+        transactional_db.flush()
+        transactional_db.add(JobOffer(job_id=job_id, worker_id=w2.id,
+                                      status=OfferStatus.accepted, expires_at=utcnow()))
+        with pytest.raises(IntegrityError):
+            transactional_db.flush()
+        transactional_db.rollback()
+
+
+def test_db_rejects_duplicate_offer_to_same_worker(transactional_db, two_companies):
+    from sqlalchemy.exc import IntegrityError
+
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1")
+    job_id = add_job(transactional_db, a.id, status=JobStatus.offering)
+    with tenant_context(transactional_db, a.id):
+        for _ in range(2):
+            transactional_db.add(JobOffer(job_id=job_id, worker_id=w1.id, expires_at=utcnow()))
+        with pytest.raises(IntegrityError):
+            transactional_db.flush()
+        transactional_db.rollback()
+
+
+# --- races on a real file-backed database ---------------------------------------------------
+
+
+def _seed_offering_job(factory, company, n_workers: int):
+    """Commit ``n_workers`` located workers and one job; return (job_id, workers)."""
+    with factory() as db:
+        workers = [add_worker(db, company.id, f"r{i}", 1.0 + i)
+                   for i in range(n_workers)]
+        job_id = add_job(db, company.id)
+        db.commit()
+    return job_id, workers
+
+
+def _offering_via_api(factory, company, job_id):
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        assert start_offering(client, company.dispatcher, job_id).status_code == 200
+    with factory() as db:
+        return offers_for(db, company.id, job_id)
+
+
+@pytest.mark.parametrize("attempt", range(5))
+def test_concurrent_ring_double_accept_one_wins(db_file_based, file_company, attempt):
+    job_id, (w1, w2) = _seed_offering_job(db_file_based, file_company, 2)
+    offers = _offering_via_api(db_file_based, file_company, job_id)
+
+    r1, r2 = fire([
+        ("POST", f"/api/offers/{offers[w1.id].id}/accept", {"headers": auth_header(w1)}),
+        ("POST", f"/api/offers/{offers[w2.id].id}/accept", {"headers": auth_header(w2)}),
+    ])
+
+    assert sorted([r1.status_code, r2.status_code]) == [200, 409]
+    winner, loser = (w1, w2) if r1.status_code == 200 else (w2, w1)
+    with db_file_based() as db:
+        job = fresh(db, file_company.id, Job, job_id)
+        assert job.status is JobStatus.assigned
+        assert job.assigned_worker_id == winner.id
+        final = offers_for(db, file_company.id, job_id)
+        assert final[winner.id].status is OfferStatus.accepted
+        assert final[loser.id].status is OfferStatus.expired
+        # Assigned: no new offers can be created for it.
+        with tenant_context(db, file_company.id):
+            assert dispatch.create_offers(db, job) == []
+
+
+def test_concurrent_same_offer_double_accept(db_file_based, file_company):
+    job_id, (w1,) = _seed_offering_job(db_file_based, file_company, 1)
+    offer_id = _offering_via_api(db_file_based, file_company, job_id)[w1.id].id
+
+    responses = fire(
+        [("POST", f"/api/offers/{offer_id}/accept", {"headers": auth_header(w1)})] * 4
+    )
+
+    assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
