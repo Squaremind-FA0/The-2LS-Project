@@ -5,12 +5,13 @@ from sqlalchemy.orm import Session
 
 from app.auth.deps import get_tenant_db, require_role
 from app.models import Role, User
-from app.schemas.jobs import JobOfferOut, WorkerLocationOut, WorkerLocationUpdate
+from app.schemas.jobs import JobOfferOut, SweepResult, WorkerLocationOut, WorkerLocationUpdate
 from app.services import dispatch as service
 
 router = APIRouter(tags=["dispatch"])
 
 _worker = require_role(Role.worker)
+_admin = require_role(Role.company_admin)
 
 _STATUS_FOR = {
     service.NotFound: status.HTTP_404_NOT_FOUND,
@@ -54,3 +55,17 @@ def decline_offer(
     except service.DispatchError as exc:
         raise_http(exc)
     return JobOfferOut.model_validate(offer)
+
+
+@router.post("/api/dispatch/sweep", response_model=SweepResult)
+def sweep_offers(
+    user: User = Depends(_admin), db: Session = Depends(get_tenant_db)
+) -> SweepResult:
+    """One bounded expiry + re-offer pass for the caller's company. Meant to
+    be called by cron or an admin; there is no background loop."""
+    summary = service.sweep(db, user.company_id)
+    return SweepResult(
+        expired_count=summary.expired_count,
+        rejobs_count=summary.rejobs_count,
+        unfilled_count=summary.unfilled_count,
+    )

@@ -18,13 +18,14 @@ Race safety comes from the database, not from read-then-check code:
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -40,6 +41,8 @@ from app.models import (
 )
 from app.models.job import utcnow
 from app.schemas.jobs import JobCreateRequest
+
+logger = logging.getLogger(__name__)
 
 EARTH_RADIUS_KM = 6371.0088  # IUGG mean Earth radius
 
@@ -433,3 +436,111 @@ def upsert_location(db: Session, worker_id: int, lat: float, lng: float) -> Work
         # the row exists now, so the retry updates it.
         db.rollback()
         return _apply()
+
+
+# --- expiry + bounded sweeper ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExpirySweep:
+    expired_count: int
+    # Offering jobs left with no pending offer: candidates for re_offer_job.
+    job_ids: list[int]
+
+
+@dataclass(frozen=True)
+class SweepSummary:
+    expired_count: int
+    rejobs_count: int
+    unfilled_count: int
+
+
+def check_offer_expiry(
+    db: Session, company_id: int, *, now: datetime | None = None
+) -> ExpirySweep:
+    """Mark the company's pending offers past ``expires_at`` expired and
+    list its offering jobs that now have no pending offer."""
+    now = now or utcnow()
+    expired = _conditional_update(
+        db,
+        update(JobOffer)
+        .where(
+            JobOffer.company_id == company_id,
+            JobOffer.status == OfferStatus.pending,
+            JobOffer.expires_at <= now,
+        )
+        .values(status=OfferStatus.expired),
+    )
+    has_pending = (
+        select(JobOffer.id)
+        .where(JobOffer.job_id == Job.id, JobOffer.status == OfferStatus.pending)
+        .exists()
+    )
+    job_ids = db.scalars(
+        select(Job.id)
+        .where(Job.company_id == company_id, Job.status == JobStatus.offering, ~has_pending)
+        .order_by(Job.id)
+    ).all()
+    return ExpirySweep(expired, list(job_ids))
+
+
+def _mark_unfilled(db: Session, job: Job) -> None:
+    _conditional_update(
+        db,
+        update(Job)
+        .where(Job.id == job.id, Job.status == JobStatus.offering)
+        .values(status=JobStatus.unfilled),
+    )
+    db.refresh(job)
+
+
+def re_offer_job(
+    db: Session,
+    job: Job,
+    ring_size: int | None = None,
+    max_rounds: int | None = None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Offer an offering job with no pending offers to the next ring of
+    workers never offered it before, and count the round.
+
+    Bounded: once ``offer_round`` reaches ``max_rounds``, or nobody new is in
+    range, the job becomes ``unfilled`` (terminal) and False is returned.
+    """
+    if job.status is not JobStatus.offering or pending_offer_count(db, job.id):
+        return False
+    ring_size = settings.DISPATCH_RING_SIZE if ring_size is None else ring_size
+    max_rounds = settings.DISPATCH_MAX_ROUNDS if max_rounds is None else max_rounds
+    if job.offer_round >= max_rounds or not create_offers(db, job, ring_size, now=now):
+        _mark_unfilled(db, job)
+        return False
+    job.offer_round += 1
+    db.flush()
+    return True
+
+
+def sweep(db: Session, company_id: int, *, now: datetime | None = None) -> SweepSummary:
+    """One bounded pass: expire, then re-offer or close each idle job once.
+
+    Not a loop and not a daemon. Each job commits on its own, so one bad job
+    is rolled back and logged without losing the rest of the pass.
+    """
+    now = now or utcnow()
+    expiry = check_offer_expiry(db, company_id, now=now)
+    db.commit()
+    rejobs = unfilled = 0
+    for job_id in expiry.job_ids:
+        try:
+            job = db.get(Job, job_id)
+            if job is None:
+                continue
+            if re_offer_job(db, job, now=now):
+                rejobs += 1
+            elif job.status is JobStatus.unfilled:
+                unfilled += 1
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("dispatch sweep: re-offer failed for job %s", job_id)
+    return SweepSummary(expiry.expired_count, rejobs, unfilled)

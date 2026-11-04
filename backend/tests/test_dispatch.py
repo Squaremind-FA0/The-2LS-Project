@@ -648,3 +648,189 @@ def test_concurrent_same_offer_double_accept(db_file_based, file_company):
     )
 
     assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
+
+
+# --- Phase 5: expiry + sweeper (tasks 15-17) -------------------------------------------------
+
+
+def expire_offers_now(db, company_id, job_id):
+    with tenant_context(db, company_id):
+        for offer in db.scalars(select(JobOffer).where(JobOffer.job_id == job_id)):
+            offer.expires_at = utcnow() - timedelta(seconds=1)
+        db.flush()
+
+
+def sweep(client, admin):
+    return client.post("/api/dispatch/sweep", headers=auth_header(admin))
+
+
+def test_expired_offer_cannot_be_accepted(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    expire_offers_now(transactional_db, a.id, job_id)
+    offer_id = offers_for(transactional_db, a.id, job_id)[w1.id].id
+
+    response = client.post(f"/api/offers/{offer_id}/accept", headers=auth_header(w1))
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == "Offer expired"
+    job = fresh(transactional_db, a.id, Job, job_id)
+    assert job.status is JobStatus.offering and job.assigned_worker_id is None
+    assert client.post(f"/api/offers/{offer_id}/decline",
+                       headers=auth_header(w1)).status_code == 410
+
+
+def test_decline_triggers_next_offer(client, two_companies, transactional_db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 1)
+    a, _ = two_companies
+    nearest = add_worker(transactional_db, a.id, "nearest", 1.0)
+    second = add_worker(transactional_db, a.id, "second", 2.0)
+    add_worker(transactional_db, a.id, "third", 3.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert set(offers) == {nearest.id}
+    declined_id = offers[nearest.id].id
+
+    response = client.post(f"/api/offers/{declined_id}/decline", headers=auth_header(nearest))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "declined"
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert set(offers) == {nearest.id, second.id}
+    assert offers[nearest.id].status is OfferStatus.declined
+    assert offers[second.id].status is OfferStatus.pending
+    assert fresh(transactional_db, a.id, Job, job_id).status is JobStatus.offering
+    again = client.post(f"/api/offers/{declined_id}/decline", headers=auth_header(nearest))
+    assert again.status_code == 409
+
+
+def test_decline_tops_up_a_partially_pending_ring(client, two_companies, transactional_db,
+                                                  monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 2)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    w3 = add_worker(transactional_db, a.id, "w3", 3.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+
+    client.post(f"/api/offers/{offers_for(transactional_db, a.id, job_id)[w1.id].id}/decline",
+                headers=auth_header(w1))
+
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert {w for w, o in offers.items() if o.status is OfferStatus.pending} == {w2.id, w3.id}
+
+
+def test_sweep_expires_offers_and_re_offers_next_ring(client, two_companies, transactional_db,
+                                                      monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 1)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    expire_offers_now(transactional_db, a.id, job_id)
+
+    response = sweep(client, a.admin)
+
+    assert response.status_code == 200
+    assert response.json() == {"expired_count": 1, "rejobs_count": 1, "unfilled_count": 0}
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert offers[w1.id].status is OfferStatus.expired
+    assert offers[w2.id].status is OfferStatus.pending
+    job = fresh(transactional_db, a.id, Job, job_id)
+    assert job.status is JobStatus.offering and job.offer_round == 2
+
+
+def test_sweep_marks_job_unfilled_when_no_workers_left(client, two_companies,
+                                                       transactional_db):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    expire_offers_now(transactional_db, a.id, job_id)
+
+    assert sweep(client, a.admin).json() == {
+        "expired_count": 1, "rejobs_count": 0, "unfilled_count": 1,
+    }
+    assert fresh(transactional_db, a.id, Job, job_id).status is JobStatus.unfilled
+    # Terminal: later sweeps leave it alone.
+    assert sweep(client, a.admin).json() == {
+        "expired_count": 0, "rejobs_count": 0, "unfilled_count": 0,
+    }
+
+
+def test_sweep_stops_after_max_rounds(client, two_companies, transactional_db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 1)
+    monkeypatch.setattr(settings, "DISPATCH_MAX_ROUNDS", 3)
+    a, _ = two_companies
+    for i in range(6):
+        add_worker(transactional_db, a.id, f"w{i}", 1.0 + i)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+
+    summaries = []
+    for _ in range(4):
+        expire_offers_now(transactional_db, a.id, job_id)
+        summaries.append(sweep(client, a.admin).json())
+
+    assert [s["rejobs_count"] for s in summaries] == [1, 1, 0, 0]
+    assert [s["unfilled_count"] for s in summaries] == [0, 0, 1, 0]
+    job = fresh(transactional_db, a.id, Job, job_id)
+    assert job.status is JobStatus.unfilled and job.offer_round == 3
+    assert len(offers_for(transactional_db, a.id, job_id)) == 3
+
+
+def test_sweep_leaves_live_offers_and_other_companies_alone(client, two_companies,
+                                                            transactional_db):
+    a, b = two_companies
+    a_worker = add_worker(transactional_db, a.id, "aw", 1.0)
+    b_worker = add_worker(transactional_db, b.id, "bw", 1.0)
+    a_job = add_job(transactional_db, a.id)
+    b_job = add_job(transactional_db, b.id)
+    start_offering(client, a.dispatcher, a_job)
+    start_offering(client, b.dispatcher, b_job)
+    expire_offers_now(transactional_db, b.id, b_job)
+
+    assert sweep(client, a.admin).json() == {
+        "expired_count": 0, "rejobs_count": 0, "unfilled_count": 0,
+    }
+    assert offers_for(transactional_db, a.id, a_job)[a_worker.id].status is OfferStatus.pending
+    assert offers_for(transactional_db, b.id, b_job)[b_worker.id].status is OfferStatus.pending
+    assert fresh(transactional_db, b.id, Job, b_job).status is JobStatus.offering
+
+
+@pytest.mark.parametrize("role", ["dispatcher", "worker"])
+def test_sweep_is_admin_only(client, two_companies, role):
+    a, _ = two_companies
+    assert sweep(client, getattr(a, role)).status_code == 403
+
+
+def test_check_offer_expiry_reports_jobs_without_pending_offers(transactional_db,
+                                                                two_companies):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1")
+    w2 = add_worker(transactional_db, a.id, "w2")
+    stale_job = add_job(transactional_db, a.id, status=JobStatus.offering)
+    live_job = add_job(transactional_db, a.id, status=JobStatus.offering)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.add_all([
+            JobOffer(job_id=stale_job, worker_id=w1.id, expires_at=utcnow() - timedelta(1)),
+            JobOffer(job_id=live_job, worker_id=w2.id, expires_at=utcnow() + timedelta(1)),
+        ])
+        transactional_db.flush()
+        result = dispatch.check_offer_expiry(transactional_db, a.id)
+
+    assert result.expired_count == 1
+    assert result.job_ids == [stale_job]
