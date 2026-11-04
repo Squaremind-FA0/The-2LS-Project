@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
+from app.routers import auth, me, workers
 
 app = FastAPI(title="API")
 app.add_middleware(
@@ -16,6 +17,15 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# API routers — keep every include_router call in this one block, above the
+# SPA catch-all below so /api/* matches first. Every /api/* route outside
+# app.auth.deps.PUBLIC_API_PATHS must depend on require_role(...) and use
+# get_tenant_db; tests/test_route_audit.py enforces that.
+app.include_router(auth.router)
+app.include_router(me.router)
+app.include_router(workers.router)
 
 
 # Single-origin production: when the built frontend exists (docker image or

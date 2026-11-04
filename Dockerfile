@@ -18,6 +18,7 @@ COPY --from=frontend-build /app/frontend/dist frontend/dist
 
 WORKDIR /app/backend
 EXPOSE 8080
-# Dev-only fallback so a bare `docker run` boots; override JWT_SECRET for any real deployment.
-ENV JWT_SECRET=dev-insecure-change-me
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8080}"]
+# No JWT_SECRET is baked into the image. Real deployments must pass one
+# (>= 32 bytes). If none is given, a random per-container secret is generated
+# so a bare `docker run` / preview still boots; tokens then die on restart.
+CMD ["sh", "-c", "export JWT_SECRET=\"${JWT_SECRET:-$(python -c 'import secrets;print(secrets.token_urlsafe(48))')}\" && alembic upgrade head && exec uvicorn app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8080}"]

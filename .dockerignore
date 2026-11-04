@@ -4,3 +4,6 @@
 **/__pycache__
 .git
 .env
+**/.env
+**/.env.local
+**/*.db
