@@ -834,3 +834,35 @@ def test_check_offer_expiry_reports_jobs_without_pending_offers(transactional_db
 
     assert result.expired_count == 1
     assert result.job_ids == [stale_job]
+
+
+# --- Phase 6: end to end over HTTP only (task 20) -------------------------------------------
+
+
+def test_e2e_job_dispatch_flow(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "e2e1")
+    w2 = add_worker(transactional_db, a.id, "e2e2")
+    for worker, km in ((w1, 1.0), (w2, 4.0)):
+        located = client.put("/api/workers/me/location",
+                             json={"lat": north_of(JOB_LAT, km), "lng": JOB_LNG},
+                             headers=auth_header(worker))
+        assert located.status_code == 200
+
+    created = client.post("/api/jobs", json=job_body(), headers=auth_header(a.dispatcher))
+    assert created.status_code == 201
+    job_id = created.json()["id"]
+    assert start_offering(client, a.dispatcher, job_id).json()["status"] == "offering"
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert set(offers) == {w1.id, w2.id}
+    o1, o2 = offers[w1.id].id, offers[w2.id].id
+
+    assert client.post(f"/api/offers/{o1}/accept", headers=auth_header(w1)).status_code == 200
+    late = client.post(f"/api/offers/{o2}/accept", headers=auth_header(w2))
+    assert late.status_code == 409 and late.json()["detail"] == "Job already assigned"
+
+    listed = client.get("/api/jobs?status=assigned", headers=auth_header(a.admin)).json()
+    assert [(j["id"], j["assigned_worker_id"]) for j in listed] == [(job_id, w1.id)]
+    final = offers_for(transactional_db, a.id, job_id)
+    assert final[w1.id].status is OfferStatus.accepted
+    assert final[w2.id].status is OfferStatus.expired

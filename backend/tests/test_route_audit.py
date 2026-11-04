@@ -111,6 +111,41 @@ def test_audit_actually_sees_the_api_routes():
     # routers invisible to it, as with a naive app.routes loop on FastAPI 0.16x).
     guarded = {r.path for r in api_routes(app) if r.path not in PUBLIC_API_PATHS}
     assert {"/api/me", "/api/workers", "/api/workers/{user_id}"} <= guarded
+    assert {
+        "/api/jobs",
+        "/api/jobs/{job_id}",
+        "/api/workers/me/location",
+        "/api/offers/{offer_id}/accept",
+        "/api/offers/{offer_id}/decline",
+        "/api/dispatch/sweep",
+    } <= guarded
+
+
+def _roles(route: EffectiveRoute) -> set[str]:
+    return {
+        role.value
+        for dep in _walk(route.dependant)
+        for role in getattr(dep.call, REQUIRE_ROLE_MARKER, ())
+    }
+
+
+def test_dispatch_routes_require_the_prp_roles():
+    expected = {
+        ("POST", "/api/jobs"): {"dispatcher"},
+        ("GET", "/api/jobs"): {"dispatcher", "company_admin"},
+        ("PATCH", "/api/jobs/{job_id}"): {"dispatcher"},
+        ("PUT", "/api/workers/me/location"): {"worker"},
+        ("POST", "/api/offers/{offer_id}/accept"): {"worker"},
+        ("POST", "/api/offers/{offer_id}/decline"): {"worker"},
+        ("POST", "/api/dispatch/sweep"): {"company_admin"},
+    }
+    actual = {
+        (method, route.path): _roles(route)
+        for route in api_routes(app)
+        for method in route.methods
+        if (method, route.path) in expected
+    }
+    assert actual == expected
 
 
 # --- self-checks: the audit must be able to fail ------------------------------------------
