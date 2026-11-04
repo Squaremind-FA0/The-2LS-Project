@@ -56,3 +56,53 @@ def test_revision_0002_follows_baseline():
     source = (BACKEND / "migrations" / "versions" / "0002_auth_tenancy.py").read_text()
     assert 'revision: str = "0002"' in source
     assert 'down_revision: Union[str, None] = "0001"' in source
+
+
+G3_TABLES = {"jobs", "worker_locations", "job_offers"}
+
+
+def test_0003_creates_dispatch_schema_and_downgrades_to_0002(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'g3.db'}"
+    engine = create_engine(db_url)
+    try:
+        _alembic(db_url, "upgrade", "head")
+        insp = inspect(engine)
+        assert G3_TABLES <= set(insp.get_table_names())
+
+        def index_cols(table):
+            return {ix["name"]: (tuple(ix["column_names"]), ix["unique"])
+                    for ix in insp.get_indexes(table)}
+
+        jobs = index_cols("jobs")
+        assert jobs["ix_jobs_company_status"] == (("company_id", "status"), False)
+        assert jobs["ix_jobs_company_scheduled_for"] == (("company_id", "scheduled_for"), False)
+        locations = index_cols("worker_locations")
+        assert locations["ix_worker_locations_worker_id"] == (("worker_id",), False)
+        assert locations["ix_worker_locations_lat_lng"] == (("lat", "lng"), False)
+        offers = index_cols("job_offers")
+        assert offers["ix_job_offers_job_id"] == (("job_id",), False)
+        assert offers["ix_job_offers_worker_status"] == (("worker_id", "status"), False)
+        assert offers["ix_job_offers_status_expires_at"] == (("status", "expires_at"), False)
+        # DB-level race guard: at most one accepted offer per job.
+        assert offers["uq_job_offers_one_accepted_per_job"] == (("job_id",), True)
+
+        uniques = {
+            t: {tuple(u["column_names"]) for u in insp.get_unique_constraints(t)}
+            for t in ("worker_locations", "job_offers")
+        }
+        assert ("company_id", "worker_id") in uniques["worker_locations"]
+        assert ("job_id", "worker_id") in uniques["job_offers"]
+
+        _alembic(db_url, "check")
+
+        _alembic(db_url, "downgrade", "0002")
+        engine.dispose()
+        remaining = set(inspect(engine).get_table_names())
+        assert not G3_TABLES & remaining
+        assert TABLES <= remaining
+
+        _alembic(db_url, "upgrade", "head")
+        engine.dispose()
+        assert G3_TABLES <= set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
