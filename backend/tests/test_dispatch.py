@@ -6,6 +6,8 @@ connection serialises everything and would hide lock contention.
 """
 
 import asyncio
+import math
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -13,8 +15,69 @@ from sqlalchemy import func, select
 
 from app.db import _build_engine, get_db
 from app.main import app
-from app.models import Base, Company, User
-from tests.factories import auth_header, make_company
+from app.models import (
+    Base,
+    Company,
+    Job,
+    JobOffer,
+    JobStatus,
+    OfferStatus,
+    Role,
+    User,
+    WorkerLocation,
+    WorkerProfile,
+)
+from app.models.job import utcnow
+from app.services import dispatch
+from tests.factories import WORKER_PASSWORD, auth_header, make_company, make_user, tenant_context
+
+JOB_LAT, JOB_LNG = -33.8688, 151.2093  # Sydney CBD
+KM_PER_DEG_LAT = 6371.0088 * math.pi / 180
+
+
+def north_of(lat: float, km: float) -> float:
+    return lat + km / KM_PER_DEG_LAT
+
+
+# --- data helpers -------------------------------------------------------------------------
+
+
+def add_worker(db, company_id, key, km=None, *, trades=("plumbing",), age=timedelta(0)):
+    """A worker (with profile) optionally located ``km`` north of the job."""
+    ref = make_user(
+        db, company_id, f"{key}@c{company_id}.test", WORKER_PASSWORD, Role.worker,
+        trades=list(trades),
+    )
+    if km is not None:
+        set_location(db, company_id, ref.id, north_of(JOB_LAT, km), JOB_LNG, age=age)
+    return ref
+
+
+def set_location(db, company_id, worker_id, lat, lng, *, age=timedelta(0)):
+    with tenant_context(db, company_id):
+        db.add(
+            WorkerLocation(worker_id=worker_id, lat=lat, lng=lng, updated_at=utcnow() - age)
+        )
+        db.flush()
+
+
+def add_job(db, company_id, *, trade="plumbing", status=JobStatus.draft, lat=JOB_LAT,
+            lng=JOB_LNG) -> int:
+    with tenant_context(db, company_id):
+        job = Job(
+            trade=trade, address="1 George St", lat=lat, lng=lng,
+            scheduled_for=utcnow() + timedelta(days=1), status=status,
+        )
+        db.add(job)
+        db.flush()
+        return job.id
+
+
+def match_ids(db, company_id, job_id, **kwargs) -> list[int]:
+    with tenant_context(db, company_id):
+        job = db.get(Job, job_id)
+        return [u.id for u in dispatch.find_nearby_workers(db, job, **kwargs)]
+
 
 # --- fixtures ---------------------------------------------------------------------------
 
@@ -120,3 +183,121 @@ def test_sqlite_engine_uses_wal_and_busy_timeout(db_file_based):
         assert db.connection().exec_driver_sql("PRAGMA busy_timeout").scalar() >= 10_000
         db.add(Company(name="x"))
         db.commit()
+
+
+# --- Phase 3: matching (tasks 9-10) ---------------------------------------------------------
+
+
+def test_haversine_matches_known_distance():
+    # Sydney -> Melbourne is ~713.4 km great-circle.
+    assert dispatch.haversine_km(-33.8688, 151.2093, -37.8136, 144.9631) == pytest.approx(
+        713.4, abs=1.0
+    )
+    assert dispatch.haversine_km(JOB_LAT, JOB_LNG, north_of(JOB_LAT, 9.9), JOB_LNG) == (
+        pytest.approx(9.9, abs=1e-6)
+    )
+
+
+def test_bounding_box_contains_radius():
+    box = dispatch.bounding_box(JOB_LAT, JOB_LNG, 10.0)
+    assert box.min_lat < north_of(JOB_LAT, -10) and box.max_lat > north_of(JOB_LAT, 10)
+    assert box.min_lng < JOB_LNG < box.max_lng
+    # 10 km east must sit inside the longitude window.
+    east = JOB_LNG + 10 / (KM_PER_DEG_LAT * math.cos(math.radians(JOB_LAT)))
+    assert box.min_lng < east < box.max_lng
+
+
+def test_bounding_box_near_antimeridian_skips_lng_filter():
+    assert dispatch.bounding_box(0.0, 179.99, 10.0).min_lng is None
+
+
+def test_radius_boundary_9_9km_matched_10_1km_not(transactional_db, two_companies):
+    a, _ = two_companies
+    near = add_worker(transactional_db, a.id, "near", 9.9)
+    add_worker(transactional_db, a.id, "far", 10.1)
+    job_id = add_job(transactional_db, a.id)
+
+    assert match_ids(transactional_db, a.id, job_id) == [near.id]
+
+
+def test_cross_company_worker_never_matched(transactional_db, two_companies):
+    a, b = two_companies
+    add_worker(transactional_db, b.id, "rival", 1.0)
+    job_id = add_job(transactional_db, a.id)
+
+    assert match_ids(transactional_db, a.id, job_id) == []
+
+
+def test_trade_must_match(transactional_db, two_companies):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "sparky", 1.0, trades=("electrical",))
+    job_id = add_job(transactional_db, a.id, trade="plumbing")
+
+    assert match_ids(transactional_db, a.id, job_id) == []
+
+
+def test_trade_match_is_case_insensitive(transactional_db, two_companies):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "caps", 1.0, trades=("Plumbing",))
+    job_id = add_job(transactional_db, a.id, trade="plumbing")
+
+    assert match_ids(transactional_db, a.id, job_id) == [w.id]
+
+
+def test_stale_location_excluded(transactional_db, two_companies):
+    a, _ = two_companies
+    fresh = add_worker(transactional_db, a.id, "fresh", 2.0, age=timedelta(minutes=4))
+    add_worker(transactional_db, a.id, "stale", 1.0, age=timedelta(hours=1))
+    job_id = add_job(transactional_db, a.id)
+
+    assert match_ids(transactional_db, a.id, job_id) == [fresh.id]
+
+
+def test_results_sorted_nearest_first(transactional_db, two_companies):
+    a, _ = two_companies
+    w3 = add_worker(transactional_db, a.id, "w3", 7.0)
+    w1 = add_worker(transactional_db, a.id, "w1", 0.5)
+    w2 = add_worker(transactional_db, a.id, "w2", 3.0)
+    job_id = add_job(transactional_db, a.id)
+
+    assert match_ids(transactional_db, a.id, job_id) == [w1.id, w2.id, w3.id]
+
+
+def test_limit_caps_results(transactional_db, two_companies):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 0.5)
+    add_worker(transactional_db, a.id, "w2", 3.0)
+    job_id = add_job(transactional_db, a.id)
+
+    assert match_ids(transactional_db, a.id, job_id, limit=1) == [w1.id]
+
+
+def test_inactive_users_and_profiles_excluded(transactional_db, two_companies):
+    a, _ = two_companies
+    off_user = add_worker(transactional_db, a.id, "offuser", 1.0)
+    off_profile = add_worker(transactional_db, a.id, "offprofile", 1.5)
+    ok = add_worker(transactional_db, a.id, "ok", 2.0)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.get(User, off_user.id).is_active = False
+        transactional_db.scalars(
+            select(WorkerProfile).where(WorkerProfile.user_id == off_profile.id)
+        ).one().active = False
+        transactional_db.flush()
+    job_id = add_job(transactional_db, a.id)
+
+    assert match_ids(transactional_db, a.id, job_id) == [ok.id]
+
+
+def test_workers_already_offered_this_job_excluded(transactional_db, two_companies):
+    a, _ = two_companies
+    offered = add_worker(transactional_db, a.id, "offered", 1.0)
+    other = add_worker(transactional_db, a.id, "other", 2.0)
+    job_id = add_job(transactional_db, a.id, status=JobStatus.offering)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.add(
+            JobOffer(job_id=job_id, worker_id=offered.id, status=OfferStatus.declined,
+                     expires_at=utcnow())
+        )
+        transactional_db.flush()
+
+    assert match_ids(transactional_db, a.id, job_id) == [other.id]
