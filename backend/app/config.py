@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     DISPATCH_OFFER_TTL_S: int = 30
     DISPATCH_MAX_ROUNDS: int = 5
 
+    # Realtime offer push (G4): first-message auth deadline, server heartbeat
+    # period (a peer silent for two periods is dropped) and per-connection
+    # outbound queue bound.
+    WS_AUTH_TIMEOUT_S: float = 5.0
+    WS_HEARTBEAT_S: float = 30.0
+    WS_QUEUE_MAX: int = 256
+
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def _split_origins(cls, value):
