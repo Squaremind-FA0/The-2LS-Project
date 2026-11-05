@@ -1,6 +1,7 @@
 """G5 — roster: shifts, the on-shift dispatch filter, and clock-in/out."""
 
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select, update
@@ -465,23 +466,24 @@ def test_clock_in_falls_back_on_the_unique_constraint(
     assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.assigned
 
 
-def test_clock_out_refuses_an_entry_closed_after_it_was_read(transactional_db, two_companies):
+def test_clock_out_refuses_an_entry_closed_after_it_was_read(
+    transactional_db, two_companies, monkeypatch
+):
     a, _ = two_companies
     job_id = assigned_job(transactional_db, a.id, a.worker.id, JobStatus.in_progress)
     closed_at = utcnow() - hours(1)
     with tenant_context(transactional_db, a.id):
-        stale = TimeEntry(job_id=job_id, worker_id=a.worker.id, started_at=closed_at - hours(1))
-        transactional_db.add(stale)
-        transactional_db.flush()
-        assert stale.ended_at is None
-        transactional_db.execute(
-            update(TimeEntry)
-            .where(TimeEntry.id == stale.id)
-            .values(ended_at=closed_at)
-            .execution_options(synchronize_session=False)
+        entry = TimeEntry(
+            job_id=job_id, worker_id=a.worker.id, started_at=closed_at - hours(1),
+            ended_at=closed_at,
         )
+        transactional_db.add(entry)
+        transactional_db.commit()  # the service's rollback must not undo this setup
+        stale_read = SimpleNamespace(id=entry.id, ended_at=None)
+        monkeypatch.setattr(entries_service, "_entry_for", lambda db, job_id: stale_read)
         with pytest.raises(dispatch.Conflict, match="already ended"):
             entries_service.clock_out(transactional_db, job_id, a.worker.id)
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.in_progress
 
 
 def test_concurrent_clock_in_only_one_wins(db_file_based, file_company):
