@@ -1,7 +1,14 @@
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_validator,
+)
 
 from app.models import JobStatus, OfferStatus
 
@@ -82,3 +89,40 @@ class SweepResult(BaseModel):
     expired_count: int
     rejobs_count: int
     unfilled_count: int
+
+
+class OfferJobSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    trade: str
+    address: str
+    lat: float
+    lng: float
+    scheduled_for: datetime
+
+
+class PendingOfferOut(JobOfferOut):
+    """An open offer: GET /api/offers/pending items and the offer.created body."""
+
+    job: OfferJobSummary
+    # None only if the worker's location row is gone.
+    distance_km: float | None
+
+    @computed_field
+    @property
+    def offer_id(self) -> int:
+        return self.id
+
+
+class OfferCreatedEvent(PendingOfferOut):
+    type: Literal["offer.created"] = "offer.created"
+
+
+class OfferClosedEvent(BaseModel):
+    type: Literal["offer.expired", "offer.taken"]
+    offer_id: int
+    job_id: int
+
+
+OfferEvent = OfferCreatedEvent | OfferClosedEvent

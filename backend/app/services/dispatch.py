@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -40,7 +40,16 @@ from app.models import (
     WorkerProfile,
 )
 from app.models.job import utcnow
-from app.schemas.jobs import JobCreateRequest
+from app.schemas.jobs import (
+    JobCreateRequest,
+    JobOfferOut,
+    OfferClosedEvent,
+    OfferCreatedEvent,
+    OfferEvent,
+    OfferJobSummary,
+    PendingOfferOut,
+)
+from app.services.offer_notifier import get_offer_notifier
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +204,89 @@ class Gone(DispatchError):
     detail = "Offer expired"
 
 
+# --- offer views and events ---------------------------------------------------------------
+#
+# Commit-then-notify: events are BUILT before db.commit() (no query after the
+# commit re-opens a transaction) and PUBLISHED only after it succeeds, so a
+# rollback can never produce a phantom push.
+
+
+@dataclass(frozen=True)
+class ClosedOffer:
+    offer_id: int
+    worker_id: int
+    job_id: int
+
+
+def _offer_view(offer: JobOffer, job: Job, location: tuple[float, float] | None) -> dict:
+    distance = None if location is None else haversine_km(job.lat, job.lng, *location)
+    return {
+        **JobOfferOut.model_validate(offer).model_dump(),
+        "job": OfferJobSummary.model_validate(job),
+        "distance_km": None if distance is None else round(distance, 3),
+    }
+
+
+def _worker_locations(db: Session, worker_ids: Iterable[int]) -> Mapping[int, tuple[float, float]]:
+    rows = db.execute(
+        select(WorkerLocation.worker_id, WorkerLocation.lat, WorkerLocation.lng).where(
+            WorkerLocation.worker_id.in_(list(worker_ids))
+        )
+    ).all()
+    return {worker_id: (lat, lng) for worker_id, lat, lng in rows}
+
+
+def _created_events(
+    db: Session, job: Job, offers: Sequence[JobOffer]
+) -> list[tuple[int, OfferEvent]]:
+    locations = _worker_locations(db, [o.worker_id for o in offers])
+    return [
+        (o.worker_id, OfferCreatedEvent(**_offer_view(o, job, locations.get(o.worker_id))))
+        for o in offers
+    ]
+
+
+def _closed_events(kind: str, closed: Iterable[ClosedOffer]) -> list[tuple[int, OfferEvent]]:
+    return [
+        (c.worker_id, OfferClosedEvent(type=kind, offer_id=c.offer_id, job_id=c.job_id))
+        for c in closed
+    ]
+
+
+def _publish(company_id: int, events: Iterable[tuple[int, OfferEvent]]) -> None:
+    """Call only after db.commit() succeeded. The write is durable by now and
+    GET /api/offers/pending recovers any lost push, so a notifier failure is
+    logged and never fails the request."""
+    notifier = get_offer_notifier()
+    for worker_id, event in events:
+        try:
+            notifier.publish(company_id, worker_id, event)
+        except Exception:
+            logger.exception("offer push failed for worker %s", worker_id)
+
+
+def list_pending_offers(
+    db: Session, worker_id: int, *, limit: int = 200, now: datetime | None = None
+) -> list[PendingOfferOut]:
+    """Current truth for one worker. Offers stay ``pending`` in the database
+    until a sweep runs, so ``expires_at`` must be checked here."""
+    now = now or utcnow()
+    rows = db.execute(
+        select(JobOffer, Job)
+        .join(Job, Job.id == JobOffer.job_id)
+        .where(
+            JobOffer.worker_id == worker_id,
+            JobOffer.status == OfferStatus.pending,
+            JobOffer.expires_at > now,
+            Job.status == JobStatus.offering,
+        )
+        .order_by(JobOffer.expires_at, JobOffer.id)
+        .limit(limit)
+    ).all()
+    location = _worker_locations(db, [worker_id]).get(worker_id)
+    return [PendingOfferOut(**_offer_view(offer, job, location)) for offer, job in rows]
+
+
 # --- jobs ---------------------------------------------------------------------------------
 
 # Dispatcher-driven transitions (PATCH). offering -> assigned happens only via
@@ -250,11 +342,14 @@ def transition_job(
         raise Conflict("Job status changed concurrently")
     db.refresh(job)
 
+    company_id = job.company_id
+    events: list[tuple[int, OfferEvent]] = []
     if target is JobStatus.offering:
-        create_offers(db, job, now=now)
+        events = _created_events(db, job, create_offers(db, job, now=now))
     elif target is JobStatus.cancelled:
-        _expire_pending(db, job_id)
+        events = _closed_events("offer.expired", _expire_pending(db, job_id))
     db.commit()
+    _publish(company_id, events)
     db.refresh(job)
     return job
 
@@ -291,13 +386,26 @@ def pending_offer_count(db: Session, job_id: int) -> int:
     )
 
 
-def _expire_pending(db: Session, job_id: int, *, except_offer_id: int | None = None) -> int:
+def _expire_returning(db: Session, stmt) -> list[ClosedOffer]:
+    """Flip ``stmt``'s offers to expired and return exactly the rows flipped.
+    RETURNING, not SELECT-then-UPDATE: a racing transition can't be misreported."""
+    rows = db.execute(
+        stmt.values(status=OfferStatus.expired)
+        .returning(JobOffer.id, JobOffer.worker_id, JobOffer.job_id)
+        .execution_options(synchronize_session=False)
+    ).all()
+    return [ClosedOffer(*row) for row in rows]
+
+
+def _expire_pending(
+    db: Session, job_id: int, *, except_offer_id: int | None = None
+) -> list[ClosedOffer]:
     stmt = update(JobOffer).where(
         JobOffer.job_id == job_id, JobOffer.status == OfferStatus.pending
     )
     if except_offer_id is not None:
         stmt = stmt.where(JobOffer.id != except_offer_id)
-    return _conditional_update(db, stmt.values(status=OfferStatus.expired))
+    return _expire_returning(db, stmt)
 
 
 def _own_offer(db: Session, offer_id: int, worker_id: int) -> JobOffer:
@@ -362,13 +470,15 @@ def accept_offer(
         # Expired or declined between our read and the claim: undo the claim.
         db.rollback()
         raise Gone("Offer expired")
-    _expire_pending(db, offer.job_id, except_offer_id=offer_id)
+    company_id = offer.company_id
+    losers = _expire_pending(db, offer.job_id, except_offer_id=offer_id)
     try:
         db.commit()
     except IntegrityError:
         # uq_job_offers_one_accepted_per_job: the database's last word.
         db.rollback()
         raise Conflict("Job already assigned") from None
+    _publish(company_id, _closed_events("offer.taken", losers))
     db.refresh(offer)
     return offer
 
@@ -403,11 +513,15 @@ def decline_offer(
         db.rollback()
         raise Conflict("Offer is no longer pending")
     db.refresh(job)
+    company_id = job.company_id
+    events: list[tuple[int, OfferEvent]] = []
     if job.status is JobStatus.offering:
-        create_offers(
+        offers = create_offers(
             db, job, settings.DISPATCH_RING_SIZE - pending_offer_count(db, job.id), now=now
         )
+        events = _created_events(db, job, offers)
     db.commit()
+    _publish(company_id, events)
     db.refresh(offer)
     return offer
 
@@ -446,6 +560,7 @@ class ExpirySweep:
     expired_count: int
     # Offering jobs left with no pending offer: candidates for re_offer_job.
     job_ids: list[int]
+    closed: list[ClosedOffer]
 
 
 @dataclass(frozen=True)
@@ -461,15 +576,13 @@ def check_offer_expiry(
     """Mark the company's pending offers past ``expires_at`` expired and
     list its offering jobs that now have no pending offer."""
     now = now or utcnow()
-    expired = _conditional_update(
+    closed = _expire_returning(
         db,
-        update(JobOffer)
-        .where(
+        update(JobOffer).where(
             JobOffer.company_id == company_id,
             JobOffer.status == OfferStatus.pending,
             JobOffer.expires_at <= now,
-        )
-        .values(status=OfferStatus.expired),
+        ),
     )
     has_pending = (
         select(JobOffer.id)
@@ -481,7 +594,7 @@ def check_offer_expiry(
         .where(Job.company_id == company_id, Job.status == JobStatus.offering, ~has_pending)
         .order_by(Job.id)
     ).all()
-    return ExpirySweep(expired, list(job_ids))
+    return ExpirySweep(len(closed), list(job_ids), closed)
 
 
 def _mark_unfilled(db: Session, job: Job) -> None:
@@ -529,17 +642,28 @@ def sweep(db: Session, company_id: int, *, now: datetime | None = None) -> Sweep
     now = now or utcnow()
     expiry = check_offer_expiry(db, company_id, now=now)
     db.commit()
+    _publish(company_id, _closed_events("offer.expired", expiry.closed))
     rejobs = unfilled = 0
     for job_id in expiry.job_ids:
         try:
             job = db.get(Job, job_id)
             if job is None:
                 continue
+            events: list[tuple[int, OfferEvent]] = []
             if re_offer_job(db, job, now=now):
                 rejobs += 1
+                # re_offer_job only proceeds with zero pending offers, so
+                # every pending offer of this job now is one it just created.
+                new_offers = db.scalars(
+                    select(JobOffer).where(
+                        JobOffer.job_id == job_id, JobOffer.status == OfferStatus.pending
+                    )
+                ).all()
+                events = _created_events(db, job, new_offers)
             elif job.status is JobStatus.unfilled:
                 unfilled += 1
             db.commit()
+            _publish(company_id, events)
         except SQLAlchemyError:
             db.rollback()
             logger.exception("dispatch sweep: re-offer failed for job %s", job_id)
