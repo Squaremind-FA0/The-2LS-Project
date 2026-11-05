@@ -16,6 +16,7 @@ function renderAt(path, user = null) {
     'GET /jobs': { body: [] },
     'GET /offers/pending': { body: [] },
     'GET /shifts': { body: [] },
+    'GET /payruns/7/paylines': { body: [] },
   });
   return render(<App />);
 }
@@ -64,6 +65,17 @@ describe('App', () => {
     renderAt('/login', USERS.company_admin);
     expect(await navHrefs()).toContain('/admin/payruns');
     await waitFor(() => expect(window.location.pathname).toBe('/admin/jobs'));
+  });
+
+  it('sends an unknown path inside an area back to that area\'s default page', async () => {
+    renderAt('/worker/no-such-page', USERS.worker);
+    await navHrefs();
+    await waitFor(() => expect(window.location.pathname).toBe('/worker/jobs'));
+  });
+
+  it('routes every worker page', async () => {
+    renderAt('/worker/pay/7', USERS.worker);
+    expect(await screen.findByRole('heading', { name: 'Pay run 7' })).toBeInTheDocument();
   });
 
   it('does not flash /login while restoring a session on reload', async () => {
