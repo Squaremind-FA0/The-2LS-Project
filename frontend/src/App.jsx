@@ -5,6 +5,7 @@ import { RoleGuard } from './auth/RoleGuard.jsx';
 import { AdminLayout } from './layouts/AdminLayout.jsx';
 import { WorkerLayout } from './layouts/WorkerLayout.jsx';
 import { AdminJobsPage } from './pages/admin/AdminJobsPage.jsx';
+import { AdminRosterPage } from './pages/admin/AdminRosterPage.jsx';
 import { AdminWorkersPage } from './pages/admin/AdminWorkersPage.jsx';
 import { Login } from './pages/Login.jsx';
 import { WorkerJobsPage } from './pages/worker/WorkerJobsPage.jsx';
@@ -64,6 +65,7 @@ export default function App() {
             <Route index element={<Navigate to="jobs" replace />} />
             <Route path="workers" element={<AdminWorkersPage />} />
             <Route path="jobs" element={<AdminJobsPage />} />
+            <Route path="roster" element={<AdminRosterPage />} />
             {/* Until the area's default page is registered: without this, /admin/jobs falls to the top-level * and redirects forever. */}
             <Route path="*" element={null} />
           </Route>
