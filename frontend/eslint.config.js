@@ -17,6 +17,8 @@ export default [
     rules: {
       ...react.configs.recommended.rules,
       'react/react-in-jsx-scope': 'off',
+      // No prop-types dependency in this project; props are covered by tests.
+      'react/prop-types': 'off',
     },
   },
 ];
