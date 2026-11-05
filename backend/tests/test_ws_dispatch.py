@@ -314,3 +314,72 @@ def test_no_publish_when_commit_fails(client, two_companies, transactional_db, m
     with pytest.raises(RuntimeError):
         start_offering(client, a.dispatcher, job_id)
     assert calls == []
+
+
+# --- Phase 5: polling fallback ----------------------------------------------------------------
+
+
+def test_get_pending_matches_the_offer_created_shape(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offer = offers_for(transactional_db, a.id, job_id)[w.id]
+
+    response = client.get("/api/offers/pending", headers=auth_header(w))
+    assert response.status_code == 200
+    [row] = response.json()
+    assert row["offer_id"] == row["id"] == offer.id
+    assert row["job_id"] == job_id
+    assert row["job"]["id"] == job_id
+    assert row["distance_km"] == pytest.approx(1.0, abs=0.01)
+    assert "expires_at" in row
+
+
+def test_get_pending_excludes_offers_past_ttl_before_any_sweep(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    expire_offers_now(transactional_db, a.id, job_id)
+
+    response = client.get("/api/offers/pending", headers=auth_header(w))
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_get_pending_excludes_taken_declined_and_other_workers_offers(
+    client, two_companies, transactional_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 2)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offers = offers_for(transactional_db, a.id, job_id)
+
+    # w1 accepts: its own offer becomes accepted, w2's becomes expired (taken).
+    assert client.post(
+        f"/api/offers/{offers[w1.id].id}/accept", headers=auth_header(w1)
+    ).status_code == 200
+    assert client.get("/api/offers/pending", headers=auth_header(w1)).json() == []
+    assert client.get("/api/offers/pending", headers=auth_header(w2)).json() == []
+
+    # A second, independent job that its own offer declines.
+    w3 = add_worker(transactional_db, a.id, "w3", 1.0, trades=("electrical",))
+    job2 = add_job(transactional_db, a.id, trade="electrical")
+    assert start_offering(client, a.dispatcher, job2).status_code == 200
+    offer2 = offers_for(transactional_db, a.id, job2)[w3.id]
+    assert client.post(
+        f"/api/offers/{offer2.id}/decline", headers=auth_header(w3)
+    ).status_code == 200
+    assert client.get("/api/offers/pending", headers=auth_header(w3)).json() == []
+
+
+def test_get_pending_requires_the_worker_role(client, two_companies):
+    a, _ = two_companies
+    assert client.get("/api/offers/pending", headers=auth_header(a.dispatcher)).status_code == 403
+    assert client.get("/api/offers/pending", headers=auth_header(a.admin)).status_code == 403

@@ -1,11 +1,17 @@
 from typing import NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.auth.deps import get_tenant_db, require_role
 from app.models import Role, User
-from app.schemas.jobs import JobOfferOut, SweepResult, WorkerLocationOut, WorkerLocationUpdate
+from app.schemas.jobs import (
+    JobOfferOut,
+    PendingOfferOut,
+    SweepResult,
+    WorkerLocationOut,
+    WorkerLocationUpdate,
+)
 from app.services import dispatch as service
 
 router = APIRouter(tags=["dispatch"])
@@ -33,6 +39,16 @@ def update_my_location(
 ) -> WorkerLocationOut:
     location = service.upsert_location(db, user.id, payload.lat, payload.lng)
     return WorkerLocationOut.model_validate(location)
+
+
+@router.get("/api/offers/pending", response_model=list[PendingOfferOut])
+def pending_offers(
+    limit: int = Query(200, ge=1, le=200),
+    user: User = Depends(_worker),
+    db: Session = Depends(get_tenant_db),
+) -> list[PendingOfferOut]:
+    """The caller's open offers. Call after every (re)connect's auth.ok."""
+    return service.list_pending_offers(db, user.id, limit=limit)
 
 
 @router.post("/api/offers/{offer_id}/accept", response_model=JobOfferOut)
