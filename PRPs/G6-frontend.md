@@ -16,28 +16,29 @@ Two working frontend apps served from the one Vite/React SPA: a tradie **worker*
 
 ## Prerequisites — read before implementing
 
-This PRP was dispatched with `main` at `fb5de96` (G1+G2+G3 only), with `prp/G4` (realtime offer push) and `prp/G5` (roster and payouts) still unmerged, each tracked by a separate merge mission. **Both have since landed, verified while writing this PRP:**
+This PRP was dispatched with `main` at `fb5de96` (G1+G2+G3 only), with `prp/G4` (realtime offer push) and `prp/G5` (roster and payouts) still unmerged, each tracked by a separate merge mission. **Both landed while this PRP was being written, verified below:**
 
-- **`prp/G4` merged** at commit `1411c98` ("Merge prp/G4: realtime offer push"). `WS /api/ws/worker`, `GET /api/offers/pending`, and the `OfferCreatedEvent`/`OfferClosedEvent` schemas are on `main` — confirmed byte-identical to `PRPs/G4-realtime-offers.md`'s design via `diff <(git show prp/G4:backend/app/routers/ws.py) <(git show main:backend/app/routers/ws.py)` (no diff).
-- **`prp/G5` merged** at commit `a77e4c7` ("Merge prp/G5: roster and payouts (shifts, on-shift dispatch, clock-in/out, pay runs, CSV export)"). `backend/app/routers/{shifts,time_entries,payruns}.py` are on `main` — confirmed byte-identical to the `prp/G5` branch tip via the same `diff` check on all three files. `backend/app/main.py`'s router block now registers all of `auth, dispatch, jobs, me, payruns, shifts, time_entries, workers, ws`.
+- **`prp/G4` merged** at commit `1411c98` ("Merge prp/G4: realtime offer push"). `WS /api/ws/worker`, `GET /api/offers/pending`, and the `OfferCreatedEvent`/`OfferClosedEvent` schemas are on `main` — `diff <(git show prp/G4:backend/app/routers/ws.py) <(git show main:backend/app/routers/ws.py)` is empty, so the merge carried `prp/G4`'s `ws.py` into `main` unchanged.
+- **`prp/G5` merged** at commit `a77e4c7` ("Merge prp/G5: roster and payouts (shifts, on-shift dispatch, clock-in/out, pay runs, CSV export)"). `backend/app/routers/{shifts,time_entries,payruns}.py` are on `main` — the same `diff` check against the `prp/G5` branch tip is empty for all three files. `backend/app/main.py`'s router block now registers `auth, dispatch, jobs, me, payruns, shifts, time_entries, workers, ws`.
 - **There is no longer a merge blocker.** Every task in this PRP's task list can be implemented directly against `main` as it stands today.
-- One incidental change worth noting: `main`'s `backend/app/routers/dispatch.py` now has `service.BadRequest -> 400` and `service.Forbidden -> 403` in its `_STATUS_FOR` map (new exception types added by G5's on-shift dispatch filter). This doesn't change any contract cited below — `ApiError` (Task 4) already handles arbitrary status codes generically.
+- Two incidental changes landed with the G5 merge, both confirmed by diffing `main` against the G4 merge point (`1411c98`) and reflected in the Context/Data-model sections below, not just noted here: `backend/app/routers/dispatch.py`'s `_STATUS_FOR` map gained `service.BadRequest -> 400` and `service.Forbidden -> 403` (new exception types the G5 code raises); and `JobStatusUpdate.status` (`backend/app/schemas/jobs.py`) now accepts `"in_progress"`/`"completed"` in addition to `"offering"`/`"cancelled"`/`"draft"`. Neither changes a contract this PRP relies on — `ApiError` (Task 4) already handles arbitrary status codes generically, and this PRP doesn't drive the dispatcher-side transition to `in_progress`/`completed` (workers do it via clock-in/clock-out).
 
 ## Context
 
 ### Existing frontend scaffold
 
 - `frontend/src/main.jsx` — mounts `<App />`, no change needed.
-- `frontend/src/App.jsx:1-26` — placeholder `Login`/`Worker`/`Admin` functions and a 4-route `Routes` tree. Replaced by Task 11.
-- `frontend/src/App.test.jsx:1-11` — asserts the placeholder's text; rewritten by Task 10.
+- `frontend/src/App.jsx:1-26` — placeholder `Login`/`Worker`/`Admin` functions and a 4-route `Routes` tree. Replaced by Task 31.
+- `frontend/src/App.test.jsx:1-11` — asserts the placeholder's text; rewritten by Task 30.
 - `frontend/src/api/client.js:1-8` — `apiFetch(path, options)`: reads `localStorage.getItem('token')`, sets `Authorization: Bearer`, hits `/api${path}`. Extended, not replaced, by Task 5.
 - `frontend/src/test/setup.js` loads `@testing-library/jest-dom/vitest`; `frontend/vitest.config.js` wires `jsdom` + `globals: true` + this setup file. Already present, no change.
-- `frontend/package.json` — `react-router-dom@^7`, `@testing-library/react@^16`, `vitest@^2`, `jsdom@^25` are already installed. **Missing:** `@testing-library/user-event`, needed for the focus-trap test (Task 19) to simulate real Tab/Shift+Tab key sequences. This is the only new dependency.
-- `frontend/vite.config.js:6` — `server.proxy['/api']` is a bare string, which Vite treats as HTTP-only; it does not proxy WebSocket upgrades. `WS /api/ws/worker` will not reach the backend from `npm run dev` until Task 41.
+- `frontend/package.json` — `react-router-dom@^7`, `@testing-library/react@^16`, `vitest@^2`, `jsdom@^25` are already installed. **Missing:** `@testing-library/user-event`, needed for the keyboard-sequence tests (Tasks 16 and 18) to simulate real Tab/Shift+Tab key sequences. This is the only new dependency.
+- `frontend/vite.config.js:6` — `server.proxy['/api']` is a bare string, which Vite treats as HTTP-only; it does not proxy WebSocket upgrades. `WS /api/ws/worker` will not reach the backend from `npm run dev` until Task 46.
+- **jsdom has no `WebSocket` global.** Any test that mounts `OfferProvider` (directly, or indirectly via `WorkerLayout`/the full `App`) needs a `WebSocket` stub installed before render — jsdom's environment doesn't ship one, so an un-stubbed test would throw `ReferenceError: WebSocket is not defined` rather than exercising the component.
 
 ### Auth / tenancy contracts (`main`, G1+G2)
 
-- `POST /api/auth/login` (`backend/app/routers/auth.py:13-23`) — `{email, password}` → `201`? no, `200 {access_token, token_type: "bearer", expires_in}` (`backend/app/schemas/auth.py`); `401 {detail: "Invalid credentials"}` on bad creds.
+- `POST /api/auth/login` (`backend/app/routers/auth.py:13-23`) — `{email, password}` → `200 {access_token, token_type: "bearer", expires_in}` (`backend/app/schemas/auth.py`); `401 {detail: "Invalid credentials"}` on bad creds.
 - `GET /api/me` (`backend/app/routers/me.py:11-27`) — any authenticated role → `{id, email, full_name, role, company_id, company_name, worker_profile: {trades, hourly_rate, active} | null}`. `role` is one of `company_admin | dispatcher | worker` (`backend/app/models/tenant.py:6-9`). This is the single source of truth for which area/nav a logged-in user sees.
 - Role-gated 401/403 are real on every route; `RoleGuard` only prevents a redirect flash, per the Non-goals note above.
 
@@ -46,17 +47,17 @@ This PRP was dispatched with `main` at `fb5de96` (G1+G2+G3 only), with `prp/G4` 
 - `POST /api/workers` (`backend/app/routers/workers.py:19-30`, `company_admin` only) — `{email, full_name, initial_password, trades[], hourly_rate}` → `201 WorkerOut`; `409 {detail: "Email already registered"}`.
 - `GET /api/workers` / `GET /api/workers/{id}` (`workers.py:33-45`, `company_admin` **or** `dispatcher`) — list/detail. No `PUT`/`DELETE` exists (see Non-goals).
 
-### Jobs (`main`, G3)
+### Jobs (`main`, G3, status literal widened by G5)
 
 - `POST /api/jobs` (`backend/app/routers/jobs.py:16-21`, `dispatcher` only) — `{trade, address, lat, lng, scheduled_for}` → `201 JobOut` (status starts `draft`, no offers made yet).
 - `GET /api/jobs` (`jobs.py:24-32`, `dispatcher` **or** `company_admin`) — `?status=&limit=&offset=`. **Workers cannot call this** — see "Known backend gaps" below.
-- `PATCH /api/jobs/{id}` (`jobs.py:35-43`, `dispatcher` only) — `{status: "offering"|"cancelled"|"draft"}` → `200 JobOut`; `400` invalid transition.
+- `PATCH /api/jobs/{id}` (`jobs.py:35-43`, `dispatcher` only) — `{status: "offering"|"cancelled"|"draft"|"in_progress"|"completed"}` → `200 JobOut`; `400` invalid transition. This PRP's backoffice only drives `offering`/`cancelled` (Task 41); the `in_progress`/`completed` values exist for the dispatcher to override a stuck job, not for the worker flow, which uses clock-in/clock-out instead (G5 decision, `PRPs/G5-roster-payouts.md` task 19).
 
 ### Dispatch / offers / location (`main`, G3+G4)
 
 - `PUT /api/workers/me/location` (`backend/app/routers/dispatch.py:34-41`, `worker`) — `{lat, lng}` → `200 WorkerLocationOut`.
 - `GET /api/offers/pending` (`dispatch.py:44-51`, `worker`) — `?limit=` (1–200) → `200 list[PendingOfferOut]`, soonest-expiring first. Call this after every WS (re)connect's `auth.ok` — see WS protocol below.
-- `POST /api/offers/{id}/accept` (`dispatch.py:54-62`, `worker`) → `200 JobOfferOut`; `409 {detail: "Job already assigned"}` (`backend/app/services/dispatch.py:425`) when someone else already won it; `410 {detail: "Offer expired"}` (`dispatch.py:204` default) when it timed out.
+- `POST /api/offers/{id}/accept` (`dispatch.py:54-62`, `worker`) → `200 JobOfferOut`; `409 {detail: "Job already assigned"}` (`backend/app/services/dispatch.py:454`) when someone else already won it; `410 {detail: "Offer expired"}` (`Gone.detail`, `backend/app/services/dispatch.py:217-218`, raised as the default when no other message is given) when it timed out.
 - `POST /api/offers/{id}/decline` (`dispatch.py:65-73`, `worker`) → `200 JobOfferOut`.
 - `PendingOfferOut` / `JobOfferOut` shape (`backend/app/schemas/jobs.py:61-69,94-115`):
   ```
@@ -81,32 +82,42 @@ This PRP was dispatched with `main` at `fb5de96` (G1+G2+G3 only), with `prp/G4` 
 
 ### Known backend gaps (frontend scoped around these, not guessed past them)
 
-1. **No worker-readable job list.** `GET /api/jobs` is `dispatcher`/`company_admin` only (`jobs.py:24`). A worker's only source of "my jobs" is the job summary embedded in an offer (`PendingOfferOut.job`) at the moment they accept it. **WorkerJobsPage (Task 27-28) is therefore a locally-held list seeded from accepted offers, not a server list** — it is empty again after a cleared browser / new device until a future PRP adds a `GET /api/jobs/mine`-style endpoint. State this limitation in the page's empty state.
-2. **No way for a worker to discover their own PayRun ids.** `GET /api/payruns` is `company_admin`-only (`PRPs/G5-roster-payouts.md` "GET /api/payruns"); `GET /api/payruns/{id}/paylines` is worker-scoped but requires already knowing `{id}`. **WorkerPayPage (Task 31-32) takes `payrunId` as a route param** (`/worker/pay/:payrunId`); with no param it shows a gap message ("ask your company for a pay run reference") instead of guessing or enumerating ids. Flag a future `GET /api/payruns/mine` as the real fix.
-3. **No company-wide roster view.** `GET /api/shifts` is `worker`-role only and 403s a `company_admin`/`dispatcher` even before checking `worker_id` (`PRPs/G5-roster-payouts.md` "GET /api/shifts": "Only workers can list their own shifts; company_admin/dispatcher get 403"). **AdminRosterPage (Task 37-38) is a placeholder** stating this explicitly; it is not wired to a fetch that would just 403. A future PRP needs a company-scoped roster read endpoint.
+1. **No worker-readable job list.** `GET /api/jobs` is `dispatcher`/`company_admin` only (`jobs.py:24`). A worker's only source of "my jobs" is the job summary embedded in an offer (`PendingOfferOut.job`) at the moment they accept it. **WorkerJobsPage (Tasks 32-33) is therefore a locally-held list seeded from accepted offers, not a server list** — it is empty again after a cleared browser / new device until a future PRP adds a `GET /api/jobs/mine`-style endpoint. State this limitation in the page's empty state.
+2. **No way for a worker to discover their own PayRun ids.** `GET /api/payruns` is `company_admin`-only (`backend/app/routers/payruns.py:20-21`); `GET /api/payruns/{id}/paylines` is worker-scoped but requires already knowing `{id}` (`payruns.py:58-66`). **WorkerPayPage (Tasks 36-37) takes `payrunId` as a route param** (`/worker/pay/:payrunId`); with no param it shows a gap message ("ask your company for a pay run reference") instead of guessing or enumerating ids. Flag a future `GET /api/payruns/mine` as the real fix.
+3. **No company-wide roster view.** `GET /api/shifts` (`backend/app/routers/shifts.py:13,27-28`) is `worker`-role only (`_worker = require_role(Role.worker)`) and 403s a `company_admin`/`dispatcher` before even reaching the `worker_id` ownership check. **AdminRosterPage (Tasks 42-43) is a placeholder** stating this explicitly; it is not wired to a fetch that would just 403. A future PRP needs a company-scoped roster read endpoint.
 4. **No worker edit/deactivate.** Covered in Non-goals.
 
 Each of these is a real product gap, not a frontend shortcut — flag them to the next backend planning pass rather than building against an endpoint that doesn't exist.
 
 ## Data model / API contracts
 
-No backend changes. This PRP only consumes the contracts above and the ones below — all now live on `main` (G1 through G5, see Prerequisites):
+No backend changes. This PRP only consumes the contracts above and the ones below — all live on `main` (G1 through G5, see Prerequisites). Error details below are the exact strings from `backend/app/services/{shifts,time_entries,payruns}.py`, not paraphrased:
 
 ```
 POST /api/shifts                           (worker)   {starts_at, ends_at} -> 201 ShiftResponse
-                                                        409 "Shift overlaps existing shift for this worker"
+                                                        400 "starts_at must be before ends_at"
+                                                        409 "Shift overlaps existing shift for this worker (new.starts_at < existing.ends_at AND new.ends_at > existing.starts_at)"
 GET  /api/shifts?worker_id=&limit=&offset= (worker)   -> 200 list[ShiftResponse]
+                                                        403 "Workers can only list own shifts" (passing another worker_id)
 
 POST /api/jobs/{job_id}/clock-in           (worker)   {} -> 200 TimeEntryResponse (assigned -> in_progress)
+                                                        404 "Job not found"
                                                         409 "Job not assigned to this worker" | "Job already has a TimeEntry" | "Worker is not on shift"
+                                                            | "Cannot clock in to a job that is {status}" (status interpolated)
 POST /api/jobs/{job_id}/clock-out          (worker)   {} -> 200 TimeEntryResponse (in_progress -> completed)
-                                                        409 "TimeEntry already ended"
+                                                        404 "Job or TimeEntry not found"
+                                                        409 "Job not assigned to this worker" | "TimeEntry already ended"
 
 GET   /api/payruns?status=&limit=&offset=  (company_admin) -> 200 list[PayRunResponse]
 POST  /api/payruns                         (company_admin) {period_start, period_end} -> 201 PayRunResponse (status: draft)
+                                                        400 "period_start must not be after period_end"
+                                                        409 "Pay period overlaps an existing payrun"
 PATCH /api/payruns/{id}                    (company_admin) {status: "approved"|"paid"} -> 200 PayRunResponse
-                                                        409 "Cannot transition from <current> to <target>" | "Cannot edit an approved/paid payrun"
-GET   /api/payruns/{id}/paylines           (worker)        -> 200 list[PayLineResponse] (own worker_id only, else 403)
+                                                        404 "Payrun not found"
+                                                        409 "Cannot edit an approved payrun" | "Cannot edit a paid payrun"
+                                                            | "Cannot transition from {current} to {target}" (any other invalid jump, e.g. draft -> paid)
+GET   /api/payruns/{id}/paylines           (worker)        -> 200 list[PayLineResponse] (own worker_id only)
+                                                        403 "No pay lines for this worker in this payrun"
 GET   /api/payruns/{id}/export?format=csv  (company_admin) -> text/csv stream
                                                         headers: worker_name,worker_email,period_start,period_end,minutes_worked,hourly_rate_cents,amount_cents
 
@@ -147,7 +158,7 @@ App
          ├─ RoleGuard allow=[worker]      (frontend/src/auth/RoleGuard.jsx)
          │  └─ WorkerLayout               (frontend/src/layouts/WorkerLayout.jsx)
          │     ├─ Nav                     (frontend/src/components/Nav.jsx)
-         │     ├─ ShareLocationToggle     (uses frontend/src/location/useShareLocation.js)
+         │     ├─ ShareLocationToggle     (frontend/src/location/ShareLocationToggle.jsx)
          │     └─ OfferProvider           (frontend/src/offers/OfferProvider.jsx)
          │        ├─ OfferModal           (frontend/src/offers/OfferModal.jsx)
          │        │  ├─ useCountdown      (frontend/src/offers/useCountdown.js)
@@ -168,6 +179,8 @@ App
 
 ## Task list
 
+Ordered bottom-up so `npm run build` and `npm test` (the Validation gates) stay green after every single task's commit, per `/prp-implement`'s "all green → commit this task" rule. **`frontend/src/App.jsx` is only ever wired to routes that already have a working element behind them** — it gets its full shell (layouts, guards, index redirects) in Task 31, once every component the shell directly imports exists, and each leaf page's own task appends its one `<Route>` line rather than one big-bang rewrite.
+
 ### Phase 0 — dependency (hotspot file)
 
 1. `frontend/package.json` — add `@testing-library/user-event` as a devDependency. **This is the only task in this PRP allowed to touch `frontend/package.json`.**
@@ -186,79 +199,97 @@ App
 8. `frontend/src/auth/RoleGuard.test.jsx` — failing test: an authenticated user whose role is not in `allow` is redirected, not rendered; an unauthenticated user is redirected to `/login`.
 9. `frontend/src/auth/RoleGuard.jsx` — implement `RoleGuard({ allow, children })` via `useAuth()` + `Navigate`. Comment explicitly: this redirect is UX only — the server remains the sole authority.
 
-### Phase 3 — shell, nav, routing
+### Phase 3 — nav and login (no layout/App dependency yet)
 
-10. `frontend/src/App.test.jsx` — rewrite the placeholder assertions (`frontend/src/App.test.jsx:7-10`): unauthenticated `/` renders the real `Login` form (email + password fields), not placeholder text.
-11. `frontend/src/App.jsx` — replace the placeholder `Login`/`Worker`/`Admin` functions (`frontend/src/App.jsx:3-13`) with the real route tree from the Route map above.
-12. `frontend/src/components/Nav.test.jsx` — failing test (**verbatim**): `worker role cannot see /admin nav`.
-13. `frontend/src/components/Nav.jsx` — implement `Nav`: link set conditioned on `useAuth().user.role` (worker: Jobs/Shifts/Pay; company_admin: Workers/Jobs/Roster/PayRuns; dispatcher: Workers(view-only)/Jobs/Roster, no PayRuns link).
-14. `frontend/src/layouts/WorkerLayout.test.jsx` — failing test: renders `Nav` plus the nested route's `Outlet` content.
-15. `frontend/src/layouts/WorkerLayout.jsx` and `frontend/src/layouts/AdminLayout.jsx` — implement both (`Nav` + `<Outlet />`; `WorkerLayout` also mounts `OfferProvider` and `ShareLocationToggle`).
-16. `frontend/src/pages/Login.jsx` — implement the login form calling `useAuth().login`; on success redirect to the role's home route; on `401` show `"Invalid credentials"` (`backend/app/routers/auth.py:19`).
+10. `frontend/src/components/Nav.test.jsx` — failing test (**verbatim**): `worker role cannot see /admin nav`.
+11. `frontend/src/components/Nav.jsx` — implement `Nav`: link set conditioned on `useAuth().user.role` (worker: Jobs/Shifts/Pay; company_admin: Workers/Jobs/Roster/PayRuns; dispatcher: Workers(view-only)/Jobs/Roster, no PayRuns link).
+12. `frontend/src/pages/Login.test.jsx` — failing test: submitting valid credentials calls `useAuth().login`; a `401` response renders `"Invalid credentials"` (`backend/app/routers/auth.py:19`) without navigating away.
+13. `frontend/src/pages/Login.jsx` — implement the login form; on success it's the caller's job (Task 31's `App.jsx`) to redirect by role, so `Login` itself just calls `login()` and lets the route tree's `RoleGuard`/index redirects take over on re-render.
 
 ### Phase 4 — realtime offers (worker; buildable today, G4 is on `main`)
 
-17. `frontend/src/offers/useCountdown.test.js` — failing test (**verbatim**, split across this hook and Task 21/22): `offer modal renders and countdown hits 0 -> disabled` — a countdown to a target `Date` reaches 0 and the hook reports a disabled state.
-18. `frontend/src/offers/useCountdown.js` — implement `useCountdown(targetDate)`: ticks every second, floors at 0, returns `{ secondsLeft, isExpired }`.
-19. `frontend/src/offers/useFocusTrap.test.jsx` — failing test (**verbatim**): `modal is keyboard-focus-trapped with labelled buttons` — using `@testing-library/user-event`'s `tab()`, focus cycles only within the trapped container (wraps from last to first and back), and the Accept/Decline buttons carry accessible labels.
-20. `frontend/src/offers/useFocusTrap.js` — implement a hand-rolled Tab/Shift+Tab `keydown` trap on a container ref. The modal renders as `role="dialog" aria-modal="true"` on a plain `<div>`, not `<dialog>` — jsdom 25 does not implement `HTMLDialogElement.showModal()`.
-21. `frontend/src/offers/OfferModal.test.jsx` — failing test (**verbatim**): `Accept calls POST /api/offers/{id}/accept and handles 409 "taken"` — clicking Accept calls `offers.accept(id)`; a `409 {detail: "Job already assigned"}` response closes the modal with a "no longer available" message rather than throwing an unhandled error; also cover `410 "Offer expired"` the same way.
-22. `frontend/src/offers/OfferModal.jsx` — implement: job details (`trade`, `address`), `distance_km`, countdown via `useCountdown(parseUtc(offer.expires_at))`, focus trap via `useFocusTrap`, labelled Accept/Decline buttons, both disabled once the countdown hits 0.
-23. `frontend/src/offers/OfferProvider.test.jsx` — failing test: after `auth.ok`, the provider calls `GET /api/offers/pending` and merges the result by `offer_id` with any already-queued WS `offer.created` events, idempotently (no duplicates).
-24. `frontend/src/offers/OfferProvider.jsx` — implement: opens `WS /api/ws/worker`, sends the `auth` frame first, on `auth.ok` fetches `GET /api/offers/pending`, keeps an offer queue keyed by `offer_id`, drops offers on `offer.expired`/`offer.taken`, exposes `activeOffer`/`accept`/`decline` via context, reconnects with backoff on `4408`/`1012`/`1013` and forces logout (via `useAuth().logout`) on `4401`/`4403`.
+14. `frontend/src/offers/useCountdown.test.js` — failing test: a countdown to a target `Date` ticks down and reports `isExpired: true` once it reaches 0 (plain hook-level test; the verbatim UI test lives in Task 18).
+15. `frontend/src/offers/useCountdown.js` — implement `useCountdown(targetDate)`: ticks every second, floors at 0, returns `{ secondsLeft, isExpired }`.
+16. `frontend/src/offers/useFocusTrap.test.jsx` — failing test: using `@testing-library/user-event`'s `tab()`, focus cycles only within a trapped container (wraps last-to-first and back). Plain hook-level test; the verbatim UI test lives in Task 18.
+17. `frontend/src/offers/useFocusTrap.js` — implement a hand-rolled Tab/Shift+Tab `keydown` trap on a container ref.
+18. `frontend/src/offers/OfferModal.test.jsx` — failing tests (**verbatim** x2, plus more): `offer modal renders and countdown hits 0 → disabled`; `modal is keyboard-focus-trapped with labelled buttons`; `Accept calls POST /api/offers/{id}/accept and handles 409 "taken"` (a `409 {detail: "Job already assigned"}` response closes the modal with a "no longer available" message instead of throwing; cover `410 "Offer expired"` the same way); and Decline calling `offers.decline(id)`.
+19. `frontend/src/offers/OfferModal.jsx` — implement: job details (`trade`, `address`), `distance_km`, countdown via `useCountdown(parseUtc(offer.expires_at))`, focus trap via `useFocusTrap` on a `role="dialog" aria-modal="true"` `<div>` (not `<dialog>` — this PRP doesn't rely on `HTMLDialogElement.showModal()`, which may not be implemented in jsdom 25), labelled Accept/Decline buttons, both disabled once the countdown hits 0.
+20. `frontend/src/offers/OfferProvider.test.jsx` — failing test: after `auth.ok` on a stubbed `WebSocket`, the provider calls `GET /api/offers/pending` and merges the result by `offer_id` with any already-queued WS `offer.created` events, idempotently (no duplicates). Install a minimal `WebSocket` stub (open/send/close plus a way to push a fake message) before this test — see the jsdom note in Context.
+21. `frontend/src/offers/OfferProvider.jsx` — implement: opens `WS /api/ws/worker`, sends the `auth` frame first, on `auth.ok` fetches `GET /api/offers/pending`, keeps an offer queue keyed by `offer_id`, drops offers on `offer.expired`/`offer.taken`, exposes `activeOffer`/`accept`/`decline` via context, reconnects with backoff on `4408`/`1012`/`1013` and forces logout (via `useAuth().logout`) on `4401`/`4403`.
 
-### Phase 5 — worker self-service (location, shifts, clock-in/out, pay)
+### Phase 5 — share-location toggle
 
-25. `frontend/src/location/useShareLocation.test.js` — failing test: toggling on calls `navigator.geolocation.watchPosition` and `PUT /api/workers/me/location` with each position; toggling off clears the watch.
-26. `frontend/src/location/useShareLocation.js` — implement the toggle hook.
-27. `frontend/src/pages/worker/WorkerJobsPage.test.jsx` — failing test: a job accepted via an offer appears in "my jobs"; "Start" calls `POST /api/jobs/{id}/clock-in` and moves it to `in_progress`; "Complete" calls `POST /api/jobs/{id}/clock-out` and moves it to `completed`.
-28. `frontend/src/pages/worker/WorkerJobsPage.jsx` — implement against the locally-held job list seeded from accepted offers (Known backend gap #1); empty state names the gap.
-29. `frontend/src/pages/worker/WorkerShiftsPage.test.jsx` — failing test: creating an overlapping shift surfaces the exact 409 detail `"Shift overlaps existing shift for this worker"`.
-30. `frontend/src/pages/worker/WorkerShiftsPage.jsx` — implement list (`GET /api/shifts`) + create form (`POST /api/shifts`).
-31. `frontend/src/pages/worker/WorkerPayPage.test.jsx` — failing test: given a `payrunId` route param, renders only that worker's own paylines from `GET /api/payruns/{id}/paylines`; with no param, renders the gap message (Known backend gap #2) instead of guessing an id.
-32. `frontend/src/pages/worker/WorkerPayPage.jsx` — implement.
+22. `frontend/src/location/useShareLocation.test.js` — failing test: toggling on calls `navigator.geolocation.watchPosition` and `PUT /api/workers/me/location` with each position; toggling off clears the watch.
+23. `frontend/src/location/useShareLocation.js` — implement the toggle hook.
+24. `frontend/src/location/ShareLocationToggle.test.jsx` — failing test: renders a labelled toggle control wired to `useShareLocation`.
+25. `frontend/src/location/ShareLocationToggle.jsx` — implement.
 
-### Phase 6 — backoffice (workers, jobs, roster placeholder, pay runs)
+### Phase 6 — layouts
 
-33. `frontend/src/pages/admin/AdminWorkersPage.test.jsx` — failing test: `company_admin` sees a create form and the created worker appears in the list; a `dispatcher` sees the list without a create form; a `409 "Email already registered"` surfaces on the form.
-34. `frontend/src/pages/admin/AdminWorkersPage.jsx` — implement `GET /api/workers`, `POST /api/workers` (admin only), link to detail (`GET /api/workers/{id}`). No edit/delete UI — the route doesn't exist (Non-goals).
-35. `frontend/src/pages/admin/AdminJobsPage.test.jsx` — failing test: `dispatcher` creates a job and the list refetches and shows its status; `company_admin` sees the list without a create form.
-36. `frontend/src/pages/admin/AdminJobsPage.jsx` — implement. "Live status" means refetch after create/transition — there is no admin-facing push.
-37. `frontend/src/pages/admin/AdminRosterPage.test.jsx` — failing test: renders the documented backend-gap message (Known backend gap #3), not a broken fetch or a 403 the user didn't ask for.
-38. `frontend/src/pages/admin/AdminRosterPage.jsx` — implement the placeholder.
-39. `frontend/src/pages/admin/AdminPayRunsPage.test.jsx` — failing test: a `draft` PayRun transitions `draft -> approved -> paid` via `PATCH /api/payruns/{id}`; a further `PATCH` after `paid` surfaces its `409` detail; an export control points at `GET /api/payruns/{id}/export?format=csv` (an `<a href>`, not a `fetch`-then-blob dance — the browser's native download handles the stream).
-40. `frontend/src/pages/admin/AdminPayRunsPage.jsx` — implement list/create/transition/export-link; `company_admin` only — hidden from `dispatcher`'s `Nav` (Task 13) and guarded in-page as a defense-in-depth UX check.
+26. `frontend/src/layouts/WorkerLayout.test.jsx` — failing test: renders `Nav`, `ShareLocationToggle`, and the nested route's `Outlet` content, with a stubbed `WebSocket` (it mounts `OfferProvider`).
+27. `frontend/src/layouts/WorkerLayout.jsx` — implement (`Nav` + `ShareLocationToggle` + `OfferProvider` wrapping `<Outlet />`).
+28. `frontend/src/layouts/AdminLayout.test.jsx` — failing test: renders `Nav` plus the nested route's `Outlet` content.
+29. `frontend/src/layouts/AdminLayout.jsx` — implement (`Nav` + `<Outlet />`).
 
-### Phase 7 — dev wiring
+### Phase 7 — app shell
 
-41. `frontend/vite.config.js` — add `ws: true` to the `/api` proxy (`frontend/vite.config.js:6`) so `WS /api/ws/worker` reaches the backend under `npm run dev`. No automated test — Vitest doesn't drive the Vite dev server; verify manually (open `/worker`, confirm the socket connects, in a real `npm run dev` + `uvicorn --reload` session) and note the manual check in the PR description.
-42. Run the full validation gate list below end to end; fix any regression before the final commit of the implementation pass.
+30. `frontend/src/App.test.jsx` — rewrite the placeholder assertions (`frontend/src/App.test.jsx:7-10`): unauthenticated `/` renders the real `Login` form (email + password fields), not placeholder text; an authenticated `worker` hitting `/admin` is redirected away, and vice versa.
+31. `frontend/src/App.jsx` — replace the placeholder `Login`/`Worker`/`Admin` functions (`frontend/src/App.jsx:3-13`) with the route **shell**: `/login` → `Login`, `/` → role-based redirect, `/worker/*` → `RoleGuard allow=[worker]` wrapping `WorkerLayout` with an index redirect to `/worker/jobs`, `/admin/*` → `RoleGuard allow=[company_admin, dispatcher]` wrapping `AdminLayout` with an index redirect to `/admin/jobs`, `*` → `NotFound`. No leaf page `<Route>` yet under `/worker/*`/`/admin/*` — those are added one at a time, below, by the task that implements each page.
+
+### Phase 8 — worker self-service pages
+
+32. `frontend/src/pages/worker/WorkerJobsPage.test.jsx` — failing test: a job accepted via an offer appears in "my jobs"; "Start" calls `POST /api/jobs/{id}/clock-in` and moves it to `in_progress`; "Complete" calls `POST /api/jobs/{id}/clock-out` and moves it to `completed`.
+33. `frontend/src/pages/worker/WorkerJobsPage.jsx` — implement against the locally-held job list seeded from accepted offers (Known backend gap #1; empty state names the gap); register `<Route path="jobs" element={<WorkerJobsPage />} />` under `/worker` in `frontend/src/App.jsx`.
+34. `frontend/src/pages/worker/WorkerShiftsPage.test.jsx` — failing test: creating an overlapping shift surfaces the exact 409 detail from the Data model section above.
+35. `frontend/src/pages/worker/WorkerShiftsPage.jsx` — implement list (`GET /api/shifts`) + create form (`POST /api/shifts`); register `<Route path="shifts" .../>` in `App.jsx`.
+36. `frontend/src/pages/worker/WorkerPayPage.test.jsx` — failing test: given a `payrunId` route param, renders only that worker's own paylines from `GET /api/payruns/{id}/paylines`; with no param, renders the gap message (Known backend gap #2) instead of guessing an id.
+37. `frontend/src/pages/worker/WorkerPayPage.jsx` — implement; register both `<Route path="pay" .../>` and `<Route path="pay/:payrunId" .../>` in `App.jsx`.
+
+### Phase 9 — backoffice pages
+
+38. `frontend/src/pages/admin/AdminWorkersPage.test.jsx` — failing test: `company_admin` sees a create form and the created worker appears in the list; a `dispatcher` sees the list without a create form; a `409 "Email already registered"` surfaces on the form.
+39. `frontend/src/pages/admin/AdminWorkersPage.jsx` — implement `GET /api/workers`, `POST /api/workers` (admin only), link to detail (`GET /api/workers/{id}`); no edit/delete UI (Non-goals); register `<Route path="workers" .../>` in `App.jsx`.
+40. `frontend/src/pages/admin/AdminJobsPage.test.jsx` — failing test: `dispatcher` creates a job and the list refetches and shows its status; `company_admin` sees the list without a create form.
+41. `frontend/src/pages/admin/AdminJobsPage.jsx` — implement ("live status" = refetch after create/transition — there is no admin-facing push); register `<Route path="jobs" .../>` in `App.jsx`.
+42. `frontend/src/pages/admin/AdminRosterPage.test.jsx` — failing test: renders the documented backend-gap message (Known backend gap #3), not a broken fetch or a 403 the user didn't ask for.
+43. `frontend/src/pages/admin/AdminRosterPage.jsx` — implement the placeholder; register `<Route path="roster" .../>` in `App.jsx`.
+44. `frontend/src/pages/admin/AdminPayRunsPage.test.jsx` — failing test: a `draft` PayRun transitions `draft -> approved -> paid` via `PATCH /api/payruns/{id}`; a further `PATCH` after `paid` surfaces its `409` detail; an export control points at `GET /api/payruns/{id}/export?format=csv` (an `<a href>`, not a `fetch`-then-blob dance — the browser's native download handles the stream).
+45. `frontend/src/pages/admin/AdminPayRunsPage.jsx` — implement list/create/transition/export-link; `company_admin` only — hidden from `dispatcher`'s `Nav` (Task 11) and guarded in-page as a defense-in-depth UX check; register `<Route path="payruns" .../>` in `App.jsx`.
+
+### Phase 10 — dev wiring and final check
+
+46. `frontend/vite.config.js` — add `ws: true` to the `/api` proxy (`frontend/vite.config.js:6`) so `WS /api/ws/worker` reaches the backend under `npm run dev`. No automated test — Vitest doesn't drive the Vite dev server; verify manually (open `/worker`, confirm the socket connects, in a real `npm run dev` + `uvicorn --reload` session) and note the manual check in the PR description.
+47. Run the full validation gate list below end to end against the complete branch; fix any regression before the final commit of the implementation pass.
 
 ## Named Vitest/RTL test list
 
-Required verbatim (do not paraphrase or weaken):
-1. `offer modal renders and countdown hits 0 → disabled`
-2. `Accept calls POST /api/offers/{id}/accept and handles 409 "taken"`
-3. `worker role cannot see /admin nav`
-4. `modal is keyboard-focus-trapped with labelled buttons`
+Required verbatim (do not paraphrase or weaken), all in `frontend/src/offers/OfferModal.test.jsx` or `frontend/src/components/Nav.test.jsx` as noted:
+1. `offer modal renders and countdown hits 0 → disabled` (`OfferModal.test.jsx`)
+2. `Accept calls POST /api/offers/{id}/accept and handles 409 "taken"` (`OfferModal.test.jsx`)
+3. `worker role cannot see /admin nav` (`Nav.test.jsx`)
+4. `modal is keyboard-focus-trapped with labelled buttons` (`OfferModal.test.jsx`)
 
 Additional tests from the task breakdown:
 5. `parseUtc reads a naive backend timestamp as UTC, not local time`
 6. `apiRequest throws ApiError with status and parsed detail on a non-2xx response`
 7. `AuthContext.login stores the token and loads the current user from GET /api/me`
 8. `RoleGuard redirects a user whose role is not in allow, and an unauthenticated user to /login`
-9. `App renders the real Login form at / when unauthenticated`
-10. `WorkerLayout renders Nav and the active child route`
-11. `OfferProvider merges GET /api/offers/pending with queued WS events by offer_id without duplicates`
+9. `Login calls useAuth().login on submit and shows "Invalid credentials" on 401`
+10. `useCountdown ticks down and reports isExpired at zero`
+11. `useFocusTrap keeps Tab/Shift+Tab cycling inside the container`
 12. `OfferModal Decline calls POST /api/offers/{id}/decline`
-13. `useShareLocation toggling on calls watchPosition and PUT /api/workers/me/location; toggling off clears the watch`
-14. `WorkerJobsPage Start/Complete call clock-in/clock-out and move the job through in_progress to completed`
-15. `WorkerShiftsPage surfaces the exact 409 overlap detail from the API`
-16. `WorkerPayPage with no payrunId route param shows the pay-run-discovery gap message instead of guessing an id`
-17. `AdminWorkersPage hides the create form from a dispatcher and surfaces 409 duplicate-email`
-18. `AdminJobsPage create form is hidden from company_admin and refetches the list after a dispatcher creates a job`
-19. `AdminRosterPage renders the documented backend-gap message`
-20. `AdminPayRunsPage transitions draft → approved → paid and blocks further edits with the 409 detail after paid`
+13. `OfferProvider merges GET /api/offers/pending with queued WS events by offer_id without duplicates`
+14. `useShareLocation toggling on calls watchPosition and PUT /api/workers/me/location; toggling off clears the watch`
+15. `WorkerLayout renders Nav, ShareLocationToggle and the active child route`
+16. `AdminLayout renders Nav and the active child route`
+17. `App renders the real Login form at / when unauthenticated, and redirects an authenticated user away from the wrong area`
+18. `WorkerJobsPage Start/Complete call clock-in/clock-out and move the job through in_progress to completed`
+19. `WorkerShiftsPage surfaces the exact 409 overlap detail from the API`
+20. `WorkerPayPage with no payrunId route param shows the pay-run-discovery gap message instead of guessing an id`
+21. `AdminWorkersPage hides the create form from a dispatcher and surfaces 409 duplicate-email`
+22. `AdminJobsPage create form is hidden from company_admin and refetches the list after a dispatcher creates a job`
+23. `AdminRosterPage renders the documented backend-gap message`
+24. `AdminPayRunsPage transitions draft → approved → paid and blocks further edits with the 409 detail after paid`
 
 ## Validation gates
 
@@ -273,7 +304,7 @@ cd frontend && npm run build
 cd frontend && npm test
 ```
 
-Plus the manual dev-proxy WS check from Task 41 (not automatable in Vitest).
+Plus the manual dev-proxy WS check from Task 46 (not automatable in Vitest).
 
 ## Acceptance criteria
 
@@ -281,15 +312,15 @@ Plus the manual dev-proxy WS check from Task 41 (not automatable in Vitest).
 2. A `worker` logging in sees `/worker/jobs`, `/worker/shifts`, `/worker/pay`, can toggle sharing location, and — with the backend running and an offer created for them — sees the accessible offer modal with job details, distance, and a live countdown, and can Accept/Decline.
 3. A `company_admin`/`dispatcher` logging in sees `/admin/*` and cannot see or reach `/worker/*` (redirected); a `worker` cannot see or reach `/admin/*` nav or routes.
 4. All four verbatim tests in the Named test list pass, plus the rest of that list.
-5. `cd frontend && npm run build` and `npm test` both pass; `frontend/package.json` was touched by exactly one task (Task 1).
-6. Before implementation starts, re-confirm `main` still contains `backend/app/routers/{shifts,time_entries,payruns}.py` and `WS /api/ws/worker` (both merged as of `a77e4c7`/`1411c98` per Prerequisites) — if a later history rewrite ever reverted either merge, re-apply the `[BLOCKED]` treatment from the original task-list drafting before continuing.
+5. `cd frontend && npm run build` and `npm test` both pass after every task's commit, not just at the end (per `/prp-implement`'s per-task gate rule); `frontend/package.json` was touched by exactly one task (Task 1).
+6. Before implementation starts, re-confirm `main` still contains `backend/app/routers/{shifts,time_entries,payruns}.py` and `WS /api/ws/worker` (both merged as of `a77e4c7`/`1411c98` per Prerequisites) — these are assumed present throughout the task list, unlike the plan's original drafting assumption that they'd ship later.
 
 ## Risks
 
-- **Scope size.** 42 tasks across two apps is large for one PRP; if the implementation session's budget is tight, the natural split is Phase 0–4 (buildable today, no G5 dependency) as one implementation pass and Phase 5/6's G5-dependent tasks as a follow-on pass once `prp/G5` lands — both still inside this one PRP file and branch, just sequenced.
+- **Scope size.** 47 tasks across two apps is large for one PRP; if the implementation session's budget is tight, a reasonable split point is after Phase 7 (Task 31 — shell builds and both layouts/guards work) as one implementation pass, with Phase 8/9's individual pages as a follow-on pass — both still inside this one PRP file and branch, just sequenced.
 - **Rebase freshness.** `prp/G6` is branched from `main` at `a77e4c7` (after both the G4 and G5 merges). If `main` moves further before `/prp-implement` runs, rebase `prp/G6` onto the new tip first and re-check the Prerequisites citations still hold.
 - **Naive-UTC timestamps.** Every countdown, shift time, and pay period date from the API has no timezone marker. Mitigation: `parseUtc` (Task 3) is the only sanctioned way to turn an API timestamp into a `Date`; a future code review should grep for bare `new Date(` against API responses.
-- **jsdom has no native `<dialog>` support.** Mitigation: the offer modal is a plain `role="dialog"` div with a hand-rolled focus trap (Tasks 19–20), not `HTMLDialogElement`.
+- **jsdom's `WebSocket`/`<dialog>` support.** jsdom doesn't provide a `WebSocket` global at all (every `OfferProvider`-touching test needs a stub, Task 20) and may not implement `HTMLDialogElement.showModal()` either. Mitigation: the offer modal never uses `<dialog>` — it's a plain `role="dialog"` div with a hand-rolled focus trap (Tasks 16–17, 19).
 - **Backend gaps 1–3 (Context).** Each scopes a page down to what the API actually supports; if a future backend PRP adds the missing endpoints, these three pages (WorkerJobsPage, WorkerPayPage, AdminRosterPage) are the ones to revisit.
 
 ## Rollback
