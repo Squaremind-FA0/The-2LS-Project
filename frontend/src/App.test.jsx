@@ -14,6 +14,8 @@ function renderAt(path, user = null) {
   mockFetch({
     'GET /me': { body: user ?? {} },
     'GET /jobs': { body: [] },
+    'GET /workers': { body: [] },
+    'GET /payruns': { body: [] },
     'GET /offers/pending': { body: [] },
     'GET /shifts': { body: [] },
     'GET /payruns/7/paylines': { body: [] },
@@ -71,6 +73,17 @@ describe('App', () => {
     renderAt('/worker/no-such-page', USERS.worker);
     await navHrefs();
     await waitFor(() => expect(window.location.pathname).toBe('/worker/jobs'));
+  });
+
+  it.each([
+    ['/admin/workers', 'Workers'],
+    ['/admin/jobs', 'Jobs'],
+    ['/admin/roster', 'Roster'],
+    ['/admin/payruns', 'Pay runs'],
+  ])('routes %s for a company_admin', async (path, heading) => {
+    renderAt(path, USERS.company_admin);
+    expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument();
+    expect(window.location.pathname).toBe(path);
   });
 
   it('routes every worker page', async () => {
