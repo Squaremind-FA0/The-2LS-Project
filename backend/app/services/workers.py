@@ -52,3 +52,13 @@ def list_workers(db: Session) -> Sequence[User]:
 
 def get_worker(db: Session, user_id: int) -> User | None:
     return db.scalars(_workers_query().where(User.id == user_id)).one_or_none()
+
+
+def set_availability(db: Session, user_id: int, is_available: bool) -> WorkerProfile | None:
+    profile = db.get(WorkerProfile, user_id)
+    if profile is None:
+        return None
+    profile.is_available = is_available
+    db.commit()
+    db.refresh(profile)
+    return profile

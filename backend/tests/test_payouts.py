@@ -20,6 +20,7 @@ from app.models import (
     User,
     WorkerProfile,
 )
+from app.models.worker_profile import rate_to_cents
 from app.services import dispatch
 from app.services import payruns as service
 from tests import test_dispatch as td
@@ -220,7 +221,7 @@ def test_amount_cents_rounds_half_up_in_exact_integers(minutes, rate_cents, expe
     [("25.00", 2500), ("19.99", 1999), ("1.15", 115), ("0.07", 7), ("4.35", 435)],
 )
 def test_hourly_rate_converts_to_cents_without_float_error(rate, expected):
-    result = service.rate_to_cents(Decimal(rate))
+    result = rate_to_cents(Decimal(rate))
     assert result == expected and type(result) is int
 
 

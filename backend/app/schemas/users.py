@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
@@ -11,7 +12,12 @@ class WorkerProfileOut(BaseModel):
 
     trades: list[str]
     hourly_rate: Decimal
+    hourly_rate_cents: int
     active: bool
+    is_available: bool
+    last_lat: float | None
+    last_lng: float | None
+    last_seen_at: datetime | None
 
 
 class MeResponse(BaseModel):

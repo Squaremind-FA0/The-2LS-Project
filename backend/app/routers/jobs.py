@@ -1,24 +1,24 @@
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.auth.deps import get_tenant_db, require_role
-from app.models import JobStatus, Role
+from app.models import JobStatus, Role, User
 from app.routers.dispatch import raise_http
-from app.schemas.jobs import JobCreateRequest, JobOut, JobStatusUpdate
+from app.schemas.jobs import JobCancelRequest, JobCreateRequest, JobOut, JobUpdateRequest
 from app.services import dispatch as service
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
-_dispatcher = require_role(Role.dispatcher)
 _staff = require_role(Role.dispatcher, Role.company_admin)
 
 
-@router.post(
-    "", response_model=JobOut, status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(_dispatcher)],
-)
-def create_job(payload: JobCreateRequest, db: Session = Depends(get_tenant_db)) -> JobOut:
-    return JobOut.model_validate(service.create_job(db, payload))
+@router.post("", response_model=JobOut, status_code=status.HTTP_201_CREATED)
+def create_job(
+    payload: JobCreateRequest,
+    user: User = Depends(_staff),
+    db: Session = Depends(get_tenant_db),
+) -> JobOut:
+    return JobOut.model_validate(service.create_job(db, payload, actor_id=user.id))
 
 
 @router.get("", response_model=list[JobOut], dependencies=[Depends(_staff)])
@@ -32,12 +32,59 @@ def list_jobs(
     return [JobOut.model_validate(job) for job in jobs]
 
 
-@router.patch("/{job_id}", response_model=JobOut, dependencies=[Depends(_dispatcher)])
-def update_job_status(
-    job_id: int, payload: JobStatusUpdate, db: Session = Depends(get_tenant_db)
+@router.get("/{job_id}", response_model=JobOut, dependencies=[Depends(_staff)])
+def get_job(job_id: int, db: Session = Depends(get_tenant_db)) -> JobOut:
+    try:
+        return JobOut.model_validate(service.get_job(db, job_id))
+    except service.DispatchError as exc:
+        raise_http(exc)
+
+
+@router.patch("/{job_id}", response_model=JobOut)
+def update_job(
+    job_id: int,
+    payload: JobUpdateRequest,
+    user: User = Depends(_staff),
+    db: Session = Depends(get_tenant_db),
 ) -> JobOut:
     try:
-        job = service.transition_job(db, job_id, JobStatus(payload.status))
+        if payload.status is not None:
+            job = service.transition_job(
+                db,
+                job_id,
+                JobStatus(payload.status),
+                actor_id=user.id,
+                expected_version=payload.version,
+            )
+        else:
+            job = service.update_job_details(db, job_id, payload.version, payload.details())
     except service.DispatchError as exc:
         raise_http(exc)
     return JobOut.model_validate(job)
+
+
+@router.post("/{job_id}/cancel", response_model=JobOut)
+def cancel_job(
+    job_id: int,
+    payload: JobCancelRequest,
+    user: User = Depends(_staff),
+    db: Session = Depends(get_tenant_db),
+) -> JobOut:
+    try:
+        job = service.transition_job(
+            db, job_id, JobStatus.cancelled, actor_id=user.id, expected_version=payload.version
+        )
+    except service.DispatchError as exc:
+        raise_http(exc)
+    return JobOut.model_validate(job)
+
+
+@router.delete(
+    "/{job_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(_staff)]
+)
+def delete_job(job_id: int, db: Session = Depends(get_tenant_db)) -> Response:
+    try:
+        service.delete_job(db, job_id)
+    except service.DispatchError as exc:
+        raise_http(exc)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

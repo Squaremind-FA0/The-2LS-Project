@@ -32,7 +32,11 @@ def test_admin_creates_worker_in_own_company(client, two_companies, transactiona
         "role": "worker",
         "company_id": a.id,
         "is_active": True,
-        "worker_profile": {"trades": ["plumbing", "gas"], "hourly_rate": "62.50", "active": True},
+        "worker_profile": {
+            "trades": ["plumbing", "gas"], "hourly_rate": "62.50", "hourly_rate_cents": 6250,
+            "active": True,
+            "is_available": True, "last_lat": None, "last_lng": None, "last_seen_at": None,
+        },
     }
     with tenant_context(transactional_db, a.id):
         user = transactional_db.get(User, body["id"])

@@ -75,7 +75,7 @@ export function OfferModal({
           <dt>Address</dt>
           <dd>{job.address}</dd>
           <dt>Scheduled</dt>
-          <dd>{formatUtc(job.scheduled_for)}</dd>
+          <dd>{formatUtc(job.scheduled_for) || 'Not scheduled'}</dd>
           <dt>Distance</dt>
           <dd>{distanceKm === null ? 'Distance unknown' : `${distanceKm.toFixed(1)} km away`}</dd>
         </dl>

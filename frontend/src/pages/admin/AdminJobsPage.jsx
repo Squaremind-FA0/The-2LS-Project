@@ -3,17 +3,16 @@ import { useState } from 'react';
 import { jobs } from '../../api/client.js';
 import { formatUtc, localInputToUtcIso } from '../../api/time.js';
 import { useLoad } from '../../api/useLoad.js';
-import { useAuth } from '../../auth/AuthContext.jsx';
 
-const EMPTY_FORM = { trade: '', address: '', lat: '', lng: '', scheduled_for: '' };
+const EMPTY_FORM = { title: '', trade: '', address: '', lat: '', lng: '', scheduled_for: '' };
 
 // Mirrors MANUAL_TRANSITIONS in backend/app/services/dispatch.py for the two
 // targets this page drives. The server still decides, and refusals are shown.
-const OFFERING = { label: 'Start offering', status: 'offering' };
+const DISPATCH = { label: 'Start dispatching', status: 'dispatching' };
 const CANCEL = { label: 'Cancel job', status: 'cancelled' };
 const TRANSITIONS = {
-  draft: [OFFERING, CANCEL],
-  offering: [CANCEL],
+  draft: [DISPATCH, CANCEL],
+  dispatching: [CANCEL],
   assigned: [CANCEL],
   in_progress: [CANCEL],
 };
@@ -33,6 +32,7 @@ function CreateJobForm({ onCreated }) {
     setBusy(true);
     try {
       await jobs.create({
+        title: form.title,
         trade: form.trade,
         address: form.address,
         lat: Number(form.lat),
@@ -51,6 +51,10 @@ function CreateJobForm({ onCreated }) {
   return (
     <form className="form" onSubmit={handleSubmit}>
       <h2>Add a job</h2>
+      <label>
+        Title
+        <input required maxLength={200} {...bind('title')} />
+      </label>
       <label>
         Trade
         <input required {...bind('trade')} />
@@ -79,7 +83,7 @@ function CreateJobForm({ onCreated }) {
   );
 }
 
-function JobRow({ job, canTransition, onChanged }) {
+function JobRow({ job, onChanged }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -87,21 +91,26 @@ function JobRow({ job, canTransition, onChanged }) {
     setError(null);
     setBusy(true);
     try {
-      await jobs.transition(job.id, status);
+      await jobs.transition(job.id, status, job.version);
       await onChanged();
     } catch (err) {
       setError(err.message);
+      // A 409 means our copy is out of date: refetch so the next try can succeed.
+      if (err.status === 409) {
+        await onChanged();
+      }
     } finally {
       setBusy(false);
     }
   }
 
-  const actions = canTransition ? (TRANSITIONS[job.status] ?? []) : [];
+  const actions = TRANSITIONS[job.status] ?? [];
   return (
     <li className="card">
-      <h2>{job.trade}</h2>
+      <h2>{job.title}</h2>
+      <p>{job.trade}</p>
       <p>{job.address}</p>
-      <p>Scheduled: {formatUtc(job.scheduled_for)}</p>
+      <p>Scheduled: {formatUtc(job.scheduled_for) || 'Not scheduled'}</p>
       <p>
         Status: <span className="status">{job.status}</span>
       </p>
@@ -120,19 +129,17 @@ function JobRow({ job, canTransition, onChanged }) {
 }
 
 export function AdminJobsPage() {
-  const { user } = useAuth();
-  const isDispatcher = user.role === 'dispatcher';
   const { data, error, loading, reload } = useLoad(() => jobs.list());
   return (
     <>
       <h1>Jobs</h1>
-      {isDispatcher && <CreateJobForm onCreated={reload} />}
+      <CreateJobForm onCreated={reload} />
       {error && <p role="alert">{error}</p>}
       {!loading && !error && data?.length === 0 && <p className="empty">No jobs yet.</p>}
       {data?.length > 0 && (
         <ul className="card-list">
           {data.map((job) => (
-            <JobRow key={job.id} job={job} canTransition={isDispatcher} onChanged={reload} />
+            <JobRow key={job.id} job={job} onChanged={reload} />
           ))}
         </ul>
       )}

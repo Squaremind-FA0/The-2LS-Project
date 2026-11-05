@@ -160,3 +160,107 @@ def test_0004_creates_roster_payroll_schema_and_downgrades_to_0003(tmp_path):
         assert G5_TABLES <= set(inspect(engine).get_table_names())
     finally:
         engine.dispose()
+
+
+def _sql(engine, *statements: str) -> None:
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
+
+
+def _rows(engine, query: str) -> list[tuple]:
+    with engine.connect() as conn:
+        return [tuple(row) for row in conn.exec_driver_sql(query).all()]
+
+
+def test_0005_migrates_real_rows_both_ways(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'm3.db'}"
+    engine = create_engine(db_url)
+    try:
+        _alembic(db_url, "upgrade", "0004")
+        _sql(
+            engine,
+            "INSERT INTO companies (id, name, created_at) VALUES (1, 'Co', '2026-01-01 00:00:00')",
+            "INSERT INTO users (id, company_id, email, password_hash, full_name, role, is_active,"
+            " token_version, created_at) VALUES (7, 1, 'w@co.test', 'x', 'W', 'worker', 1, 0,"
+            " '2026-01-01 00:00:00'), (8, 1, 'n@co.test', 'x', 'N', 'worker', 1, 0,"
+            " '2026-01-01 00:00:00')",
+            "INSERT INTO worker_profiles (id, user_id, company_id, trades, hourly_rate, active)"
+            " VALUES (50, 7, 1, '[\"gas\"]', 19.99, 1), (51, 8, 1, '[]', 55.10, 0)",
+            "INSERT INTO worker_locations (company_id, worker_id, lat, lng, updated_at)"
+            " VALUES (1, 7, -33.5, 151.25, '2026-02-02 03:04:05')",
+            "INSERT INTO jobs (id, company_id, trade, address, lat, lng, scheduled_for, status,"
+            " offer_round, created_at, updated_at) VALUES"
+            " (1, 1, 'gas', 'A', 1.0, 2.0, '2026-03-01 09:00:00', 'offering', 1,"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00'),"
+            " (2, 1, 'gas', 'B', 1.0, 2.0, '2026-03-02 09:00:00', 'draft', 0,"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            "INSERT INTO job_offers (id, company_id, job_id, worker_id, status, expires_at,"
+            " created_at, updated_at) VALUES (1, 1, 1, 7, 'pending', '2026-03-01 09:00:00',"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+        )
+
+        _alembic(db_url, "upgrade", "head")
+        engine.dispose()
+        assert _rows(
+            engine,
+            "SELECT id, status, title, description, version, created_by FROM jobs ORDER BY id",
+        ) == [(1, "dispatching", "gas", "", 1, None), (2, "draft", "gas", "", 1, None)]
+        profiles = _rows(
+            engine,
+            "SELECT user_id, company_id, trades, hourly_rate_cents, active, is_available,"
+            " last_lat, last_lng, last_seen_at FROM worker_profiles ORDER BY user_id",
+        )
+        assert [row[:2] + row[3:8] for row in profiles] == [
+            (7, 1, 1999, 1, 1, -33.5, 151.25),
+            (8, 1, 5510, 0, 1, None, None),
+        ]
+        assert profiles[0][8].startswith("2026-02-02 03:04:05")
+        assert profiles[1][8] is None
+
+        insp = inspect(engine)
+        assert insp.get_pk_constraint("worker_profiles")["constrained_columns"] == ["user_id"]
+        assert "ix_worker_profiles_company_id" in {
+            ix["name"] for ix in insp.get_indexes("worker_profiles")
+        }
+        assert "job_events" in insp.get_table_names()
+        scheduled = {c["name"]: c for c in insp.get_columns("jobs")}["scheduled_for"]
+        assert scheduled["nullable"] is True
+        # The rebuild of jobs must not lose its dependants.
+        assert _rows(engine, "SELECT job_id, worker_id FROM job_offers") == [(1, 7)]
+        _alembic(db_url, "check")
+
+        # Rows only the new schema allows must survive the way back.
+        _sql(
+            engine,
+            "UPDATE jobs SET scheduled_for = NULL WHERE id = 2",
+            "INSERT INTO job_events (company_id, job_id, from_status, to_status, at)"
+            " VALUES (1, 1, 'draft', 'dispatching', '2026-03-01 00:00:00')",
+        )
+        _alembic(db_url, "downgrade", "0004")
+        engine.dispose()
+        assert _rows(engine, "SELECT id, status FROM jobs ORDER BY id") == [
+            (1, "offering"), (2, "draft"),
+        ]
+        insp = inspect(engine)
+        assert "job_events" not in insp.get_table_names()
+        [(backfilled,)] = _rows(engine, "SELECT scheduled_for FROM jobs WHERE id = 2")
+        assert backfilled.startswith("2026-01-01 00:00:00")
+        assert insp.get_pk_constraint("worker_profiles")["constrained_columns"] == ["id"]
+        assert _rows(
+            engine, "SELECT user_id, trades, active FROM worker_profiles ORDER BY user_id"
+        ) == [(7, '["gas"]', 1), (8, "[]", 0)]
+        rates = _rows(engine, "SELECT hourly_rate FROM worker_profiles ORDER BY user_id")
+        assert [float(rate) for (rate,) in rates] == [19.99, 55.10]
+        assert ("user_id",) in {
+            tuple(u["column_names"]) for u in insp.get_unique_constraints("worker_profiles")
+        }
+        assert {c["name"] for c in insp.get_columns("jobs")}.isdisjoint(
+            {"title", "description", "created_by", "version"}
+        )
+        assert _rows(engine, "SELECT job_id, worker_id FROM job_offers") == [(1, 7)]
+
+        _alembic(db_url, "upgrade", "head")
+        _alembic(db_url, "check")
+    finally:
+        engine.dispose()

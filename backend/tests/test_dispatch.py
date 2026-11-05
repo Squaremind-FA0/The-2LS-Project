@@ -312,7 +312,7 @@ def test_workers_already_offered_this_job_excluded(transactional_db, two_compani
     a, _ = two_companies
     offered = add_worker(transactional_db, a.id, "offered", 1.0)
     other = add_worker(transactional_db, a.id, "other", 2.0)
-    job_id = add_job(transactional_db, a.id, status=JobStatus.offering)
+    job_id = add_job(transactional_db, a.id, status=JobStatus.dispatching)
     with tenant_context(transactional_db, a.id):
         transactional_db.add(
             JobOffer(job_id=job_id, worker_id=offered.id, status=OfferStatus.declined,
@@ -328,6 +328,7 @@ def test_workers_already_offered_this_job_excluded(transactional_db, two_compani
 
 def job_body(**overrides) -> dict:
     body = {
+        "title": "Fix tap",
         "trade": "plumbing",
         "address": "1 George St, Sydney",
         "lat": JOB_LAT,
@@ -353,7 +354,8 @@ def offers_for(db, company_id, job_id) -> dict[int, JobOffer]:
 
 def start_offering(client, dispatcher, job_id):
     return client.patch(
-        f"/api/jobs/{job_id}", json={"status": "offering"}, headers=auth_header(dispatcher)
+        f"/api/jobs/{job_id}", json={"version": 1, "status": "dispatching"},
+        headers=auth_header(dispatcher),
     )
 
 
@@ -371,10 +373,9 @@ def test_dispatcher_creates_draft_job(client, two_companies, transactional_db):
     assert fresh(transactional_db, a.id, Job, body["id"]).company_id == a.id
 
 
-@pytest.mark.parametrize("role", ["worker", "admin"])
-def test_only_dispatcher_creates_jobs(client, two_companies, role):
+def test_worker_cannot_create_jobs(client, two_companies):
     a, _ = two_companies
-    response = client.post("/api/jobs", json=job_body(), headers=auth_header(getattr(a, role)))
+    response = client.post("/api/jobs", json=job_body(), headers=auth_header(a.worker))
     assert response.status_code == 403
 
 
@@ -392,14 +393,14 @@ def test_create_job_rejects_smuggled_fields_and_bad_coordinates(client, two_comp
 def test_list_jobs_is_company_scoped_and_filterable(client, two_companies, transactional_db):
     a, b = two_companies
     draft = add_job(transactional_db, a.id)
-    offering = add_job(transactional_db, a.id, status=JobStatus.offering)
+    offering = add_job(transactional_db, a.id, status=JobStatus.dispatching)
     add_job(transactional_db, b.id)
 
     for staff in (a.dispatcher, a.admin):
         listed = client.get("/api/jobs", headers=auth_header(staff))
         assert listed.status_code == 200
         assert [j["id"] for j in listed.json()] == [draft, offering]
-    only = client.get("/api/jobs?status=offering", headers=auth_header(a.dispatcher)).json()
+    only = client.get("/api/jobs?status=dispatching", headers=auth_header(a.dispatcher)).json()
     assert [j["id"] for j in only] == [offering]
     page = client.get("/api/jobs?limit=1&offset=1", headers=auth_header(a.dispatcher)).json()
     assert [j["id"] for j in page] == [offering]
@@ -421,7 +422,7 @@ def test_offering_transition_offers_nearest_ring(client, two_companies, transact
     response = start_offering(client, a.dispatcher, job_id)
 
     assert response.status_code == 200
-    assert response.json()["status"] == "offering"
+    assert response.json()["status"] == "dispatching"
     assert response.json()["offer_round"] == 1
     offers = offers_for(transactional_db, a.id, job_id)
     assert set(offers) == {w1.id, w2.id}
@@ -435,22 +436,22 @@ def test_offering_transition_offers_nearest_ring(client, two_companies, transact
     ("start", "target"),
     [
         (JobStatus.draft, "draft"),
-        (JobStatus.offering, "offering"),
-        (JobStatus.offering, "draft"),
-        (JobStatus.cancelled, "offering"),
-        (JobStatus.assigned, "offering"),
+        (JobStatus.dispatching, "dispatching"),
+        (JobStatus.dispatching, "draft"),
+        (JobStatus.cancelled, "dispatching"),
+        (JobStatus.assigned, "dispatching"),
         (JobStatus.assigned, "completed"),
-        (JobStatus.in_progress, "offering"),
+        (JobStatus.in_progress, "dispatching"),
         (JobStatus.completed, "in_progress"),
         (JobStatus.completed, "cancelled"),
         (JobStatus.cancelled, "in_progress"),
-        (JobStatus.unfilled, "offering"),
+        (JobStatus.unfilled, "dispatching"),
     ],
 )
 def test_invalid_transitions_are_400(client, two_companies, transactional_db, start, target):
     a, _ = two_companies
     job_id = add_job(transactional_db, a.id, status=start)
-    response = client.patch(f"/api/jobs/{job_id}", json={"status": target},
+    response = client.patch(f"/api/jobs/{job_id}", json={"version": 1, "status": target},
                             headers=auth_header(a.dispatcher))
     assert response.status_code == 400
     assert fresh(transactional_db, a.id, Job, job_id).status is start
@@ -469,7 +470,7 @@ def test_cancel_offering_job_expires_pending_offers(client, two_companies, trans
     job_id = add_job(transactional_db, a.id)
     assert start_offering(client, a.dispatcher, job_id).status_code == 200
 
-    response = client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"},
+    response = client.patch(f"/api/jobs/{job_id}", json={"version": 2, "status": "cancelled"},
                             headers=auth_header(a.dispatcher))
 
     assert response.status_code == 200
@@ -592,7 +593,7 @@ def test_db_rejects_second_accepted_offer_for_a_job(transactional_db, two_compan
     a, _ = two_companies
     w1 = add_worker(transactional_db, a.id, "w1")
     w2 = add_worker(transactional_db, a.id, "w2")
-    job_id = add_job(transactional_db, a.id, status=JobStatus.offering)
+    job_id = add_job(transactional_db, a.id, status=JobStatus.dispatching)
     with tenant_context(transactional_db, a.id):
         transactional_db.add(JobOffer(job_id=job_id, worker_id=w1.id,
                                       status=OfferStatus.accepted, expires_at=utcnow()))
@@ -609,7 +610,7 @@ def test_db_rejects_duplicate_offer_to_same_worker(transactional_db, two_compani
 
     a, _ = two_companies
     w1 = add_worker(transactional_db, a.id, "w1")
-    job_id = add_job(transactional_db, a.id, status=JobStatus.offering)
+    job_id = add_job(transactional_db, a.id, status=JobStatus.dispatching)
     with tenant_context(transactional_db, a.id):
         for _ in range(2):
             transactional_db.add(JobOffer(job_id=job_id, worker_id=w1.id, expires_at=utcnow()))
@@ -702,7 +703,7 @@ def test_expired_offer_cannot_be_accepted(client, two_companies, transactional_d
     assert response.status_code == 410
     assert response.json()["detail"] == "Offer expired"
     job = fresh(transactional_db, a.id, Job, job_id)
-    assert job.status is JobStatus.offering and job.assigned_worker_id is None
+    assert job.status is JobStatus.dispatching and job.assigned_worker_id is None
     assert client.post(f"/api/offers/{offer_id}/decline",
                        headers=auth_header(w1)).status_code == 410
 
@@ -729,7 +730,7 @@ def test_decline_triggers_next_offer(client, two_companies, transactional_db, mo
     assert set(offers) == {nearest.id, second.id}
     assert offers[nearest.id].status is OfferStatus.declined
     assert offers[second.id].status is OfferStatus.pending
-    assert fresh(transactional_db, a.id, Job, job_id).status is JobStatus.offering
+    assert fresh(transactional_db, a.id, Job, job_id).status is JobStatus.dispatching
     again = client.post(f"/api/offers/{declined_id}/decline", headers=auth_header(nearest))
     assert again.status_code == 409
 
@@ -773,7 +774,7 @@ def test_sweep_expires_offers_and_re_offers_next_ring(client, two_companies, tra
     assert offers[w1.id].status is OfferStatus.expired
     assert offers[w2.id].status is OfferStatus.pending
     job = fresh(transactional_db, a.id, Job, job_id)
-    assert job.status is JobStatus.offering and job.offer_round == 2
+    assert job.status is JobStatus.dispatching and job.offer_round == 2
 
 
 def test_sweep_marks_job_unfilled_when_no_workers_left(client, two_companies,
@@ -833,7 +834,7 @@ def test_sweep_leaves_live_offers_and_other_companies_alone(client, two_companie
     }
     assert offers_for(transactional_db, a.id, a_job)[a_worker.id].status is OfferStatus.pending
     assert offers_for(transactional_db, b.id, b_job)[b_worker.id].status is OfferStatus.pending
-    assert fresh(transactional_db, b.id, Job, b_job).status is JobStatus.offering
+    assert fresh(transactional_db, b.id, Job, b_job).status is JobStatus.dispatching
 
 
 @pytest.mark.parametrize("role", ["dispatcher", "worker"])
@@ -847,8 +848,8 @@ def test_check_offer_expiry_reports_jobs_without_pending_offers(transactional_db
     a, _ = two_companies
     w1 = add_worker(transactional_db, a.id, "w1")
     w2 = add_worker(transactional_db, a.id, "w2")
-    stale_job = add_job(transactional_db, a.id, status=JobStatus.offering)
-    live_job = add_job(transactional_db, a.id, status=JobStatus.offering)
+    stale_job = add_job(transactional_db, a.id, status=JobStatus.dispatching)
+    live_job = add_job(transactional_db, a.id, status=JobStatus.dispatching)
     with tenant_context(transactional_db, a.id):
         transactional_db.add_all([
             JobOffer(job_id=stale_job, worker_id=w1.id, expires_at=utcnow() - timedelta(1)),
@@ -877,7 +878,7 @@ def test_e2e_job_dispatch_flow(client, two_companies, transactional_db):
     created = client.post("/api/jobs", json=job_body(), headers=auth_header(a.dispatcher))
     assert created.status_code == 201
     job_id = created.json()["id"]
-    assert start_offering(client, a.dispatcher, job_id).json()["status"] == "offering"
+    assert start_offering(client, a.dispatcher, job_id).json()["status"] == "dispatching"
     offers = offers_for(transactional_db, a.id, job_id)
     assert set(offers) == {w1.id, w2.id}
     o1, o2 = offers[w1.id].id, offers[w2.id].id
@@ -905,7 +906,7 @@ def test_concurrent_draft_to_offering_only_one_succeeds(db_file_based, file_comp
 
     responses = fire(
         [
-            ("PATCH", f"/api/jobs/{job_id}", {"json": {"status": "offering"},
+            ("PATCH", f"/api/jobs/{job_id}", {"json": {"version": 1, "status": "dispatching"},
                                               "headers": auth_header(file_company.dispatcher)})
             for _ in range(2)
         ]
@@ -918,7 +919,7 @@ def test_concurrent_draft_to_offering_only_one_succeeds(db_file_based, file_comp
     assert codes[1] in (400, 409)
     with db_file_based() as db:
         job = fresh(db, file_company.id, Job, job_id)
-        assert job.status is JobStatus.offering
+        assert job.status is JobStatus.dispatching
 
 
 def test_concurrent_location_upsert_both_new_workers_race_on_integrity(
@@ -1020,7 +1021,7 @@ def test_concurrent_transitions_after_accept_are_rejected(db_file_based, file_co
     assert r[0].status_code == 200
 
     # Try to transition back to draft (should fail: assigned is terminal or only -> cancelled)
-    r = fire([("PATCH", f"/api/jobs/{job_id}", {"json": {"status": "draft"},
+    r = fire([("PATCH", f"/api/jobs/{job_id}", {"json": {"version": 3, "status": "draft"},
                                                 "headers": auth_header(file_company.dispatcher)})])
     assert r[0].status_code == 400
 

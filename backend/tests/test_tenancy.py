@@ -35,7 +35,8 @@ def tenants(transactional_db):
             db.add_all([admin, worker, profile])
             db.flush()
         ids[key] = {
-            "company": company.id, "admin": admin.id, "worker": worker.id, "profile": profile.id
+            "company": company.id, "admin": admin.id, "worker": worker.id,
+            "profile": profile.user_id,
         }
     db.expunge_all()
     return ids
@@ -145,7 +146,7 @@ def _reach_b_worker_from_non_tenant_entity(b_worker_id):
         "aliased-join": select(Company.name).join(ua, Company.id == ua.company_id).where(
             ua.id == b_worker_id
         ),
-        "relationship-has": select(WorkerProfile.id).where(
+        "relationship-has": select(WorkerProfile.user_id).where(
             WorkerProfile.user.has(User.id == b_worker_id)
         ),
     }
@@ -191,7 +192,7 @@ def cross_linked_profile(transactional_db, tenants):
         db.add(bad)
         db.flush()
     db.expunge_all()
-    return bad.id
+    return bad.user_id
 
 
 def test_relationship_lazy_load_is_filtered(transactional_db, tenants, cross_linked_profile):
@@ -253,9 +254,9 @@ def test_bulk_delete_only_touches_own_company(transactional_db, tenants):
     db = transactional_db
     with tenant_context(db, tenants["a"]["company"]):
         assert db.execute(delete(WorkerProfile)).rowcount == 1
-        targeted = delete(WorkerProfile).where(WorkerProfile.id == tenants["b"]["profile"])
+        targeted = delete(WorkerProfile).where(WorkerProfile.user_id == tenants["b"]["profile"])
         assert db.execute(targeted).rowcount == 0
-    remaining = db.scalars(select(WorkerProfile.id).execution_options(**SKIP)).all()
+    remaining = db.scalars(select(WorkerProfile.user_id).execution_options(**SKIP)).all()
     assert remaining == [tenants["b"]["profile"]]
 
 

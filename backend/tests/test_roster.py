@@ -259,7 +259,7 @@ def test_clock_in_requires_assigned_and_moves_job_to_in_progress(
 
 @pytest.mark.parametrize(
     "status",
-    [JobStatus.offering, JobStatus.in_progress, JobStatus.completed, JobStatus.cancelled],
+    [JobStatus.dispatching, JobStatus.in_progress, JobStatus.completed, JobStatus.cancelled],
 )
 def test_clock_in_refuses_a_job_that_is_not_assigned_status(
     client, two_companies, transactional_db, status
@@ -386,7 +386,8 @@ def test_clock_out_of_a_job_cancelled_mid_work_keeps_the_hours_and_the_status(
     job_id = on_shift_worker_job(transactional_db, a)
     clock(client, "in", job_id, a.worker)
     cancel = client.patch(
-        f"/api/jobs/{job_id}", json={"status": "cancelled"}, headers=auth_header(a.dispatcher)
+        f"/api/jobs/{job_id}", json={"version": 2, "status": "cancelled"},
+        headers=auth_header(a.dispatcher),
     )
     assert cancel.status_code == 200
 
@@ -411,7 +412,8 @@ def test_dispatcher_can_drive_the_extended_transitions(
     a, _ = two_companies
     job_id = assigned_job(transactional_db, a.id, a.worker.id, start)
     response = client.patch(
-        f"/api/jobs/{job_id}", json={"status": target}, headers=auth_header(a.dispatcher)
+        f"/api/jobs/{job_id}", json={"version": 1, "status": target},
+        headers=auth_header(a.dispatcher),
     )
     assert response.status_code == 200
     assert response.json()["status"] == target

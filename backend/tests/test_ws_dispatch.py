@@ -50,6 +50,7 @@ def test_offer_created_event_json_contract():
         created_at="2026-11-05T10:00:00",
         job={
             "id": 3,
+            "title": "Fix tap",
             "trade": "plumbing",
             "address": "1 George St",
             "lat": -33.86,
@@ -216,7 +217,8 @@ def test_cancel_publishes_offer_expired(client, two_companies, transactional_db,
     assert start_offering(client, a.dispatcher, job_id).status_code == 200
     pushed.clear()
     response = client.patch(
-        f"/api/jobs/{job_id}", json={"status": "cancelled"}, headers=auth_header(a.dispatcher)
+        f"/api/jobs/{job_id}", json={"version": 2, "status": "cancelled"},
+        headers=auth_header(a.dispatcher),
     )
     assert response.status_code == 200
     [(company_id, worker_id, event)] = pushed
@@ -555,7 +557,7 @@ def test_taken_and_expired_routes(client, two_companies, transactional_db):
     with worker_socket(client, w2) as ws:
         response = client.patch(
             f"/api/jobs/{job2_id}",
-            json={"status": "cancelled"},
+            json={"version": 2, "status": "cancelled"},
             headers=auth_header(a.dispatcher),
         )
         assert response.status_code == 200

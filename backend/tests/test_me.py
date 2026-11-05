@@ -32,7 +32,10 @@ def test_me_for_worker_includes_profile_and_company(client, two_companies):
         "role": "worker",
         "company_id": a.id,
         "company_name": "Alpha Plumbing",
-        "worker_profile": {"trades": ["a"], "hourly_rate": "55.00", "active": True},
+        "worker_profile": {
+            "trades": ["a"], "hourly_rate": "55.00", "hourly_rate_cents": 5500, "active": True,
+            "is_available": True, "last_lat": None, "last_lng": None, "last_seen_at": None,
+        },
     }
 
 

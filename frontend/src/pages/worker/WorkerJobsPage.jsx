@@ -31,7 +31,7 @@ function JobCard({ job, onStatus }) {
     <li className="card">
       <h2>{job.trade}</h2>
       <p>{job.address}</p>
-      <p>Scheduled: {formatUtc(job.scheduled_for)}</p>
+      <p>Scheduled: {formatUtc(job.scheduled_for) || 'Not scheduled'}</p>
       <p>
         Status: <span className="status">{job.status}</span>
       </p>

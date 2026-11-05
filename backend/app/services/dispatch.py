@@ -6,7 +6,7 @@ around them.
 
 Race safety comes from the database, not from read-then-check code:
 
-* accept: a conditional ``UPDATE jobs ... WHERE status='offering' AND
+* accept: a conditional ``UPDATE jobs ... WHERE status='dispatching' AND
   assigned_worker_id IS NULL`` lets exactly one transaction claim the job,
   and the partial unique index ``uq_job_offers_one_accepted_per_job``
   rejects a second accepted offer for a job outright;
@@ -24,11 +24,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.domain.job_state import (
+    TERMINAL,
+    IllegalTransition,
+    StaleJob,
+    transition,
+    update_details,
+)
 from app.models import (
     Job,
     JobOffer,
@@ -136,7 +143,7 @@ def find_nearby_workers(
     limit: int | None = None,
     now: datetime | None = None,
 ) -> list[User]:
-    """Active workers of the job's company with the job's trade, on shift at
+    """Active, available workers of the job's company with the job's trade, on shift at
     ``now``, with a location fresher than ``max_staleness_minutes`` and within
     ``max_distance_km``, nearest first. Workers already offered this job (any
     status) are excluded, so re-offering always reaches new workers."""
@@ -171,6 +178,7 @@ def find_nearby_workers(
         .where(User.role == Role.worker)
         .where(User.is_active.is_(True))
         .where(WorkerProfile.active.is_(True))
+        .where(WorkerProfile.is_available.is_(True))
         .where(WorkerLocation.updated_at >= cutoff)
         .where(WorkerLocation.lat.between(box.min_lat, box.max_lat))
         .where(User.id.not_in(already_offered))
@@ -300,7 +308,7 @@ def list_pending_offers(
             JobOffer.worker_id == worker_id,
             JobOffer.status == OfferStatus.pending,
             JobOffer.expires_at > now,
-            Job.status == JobStatus.offering,
+            Job.status == JobStatus.dispatching,
         )
         .order_by(JobOffer.expires_at, JobOffer.id)
         .limit(limit)
@@ -311,23 +319,79 @@ def list_pending_offers(
 
 # --- jobs ---------------------------------------------------------------------------------
 
-# Dispatcher-driven transitions (PATCH). offering -> assigned happens only via
-# accept_offer, offering -> unfilled only via the sweeper. Workers drive
+# Dispatcher-driven transitions (PATCH). dispatching -> assigned happens only via
+# accept_offer, dispatching -> unfilled only via the sweeper. Workers drive
 # assigned -> in_progress -> completed with app.services.time_entries, which
 # also records the time worked; these PATCH paths record none.
+#
+# A subset of app.domain.job_state.TRANSITIONS, which says what can happen at
+# all; this says what a dispatcher may ask for directly.
 MANUAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
-    JobStatus.draft: frozenset({JobStatus.offering, JobStatus.cancelled}),
-    JobStatus.offering: frozenset({JobStatus.cancelled}),
+    JobStatus.draft: frozenset({JobStatus.dispatching, JobStatus.cancelled}),
+    JobStatus.dispatching: frozenset({JobStatus.cancelled}),
     JobStatus.assigned: frozenset({JobStatus.in_progress, JobStatus.cancelled}),
     JobStatus.in_progress: frozenset({JobStatus.completed, JobStatus.cancelled}),
 }
 
 
-def create_job(db: Session, payload: JobCreateRequest) -> Job:
-    job = Job(**payload.model_dump(), status=JobStatus.draft)
+STALE_VERSION = "Job was changed by someone else; reload and try again"
+
+
+def create_job(db: Session, payload: JobCreateRequest, *, actor_id: int | None = None) -> Job:
+    job = Job(**payload.model_dump(), status=JobStatus.draft, created_by=actor_id)
     db.add(job)
     db.commit()
     return job
+
+
+def get_job(db: Session, job_id: int) -> Job:
+    job = db.get(Job, job_id)
+    if job is None:
+        raise NotFound("Job not found")
+    return job
+
+
+def update_job_details(db: Session, job_id: int, expected_version: int, fields: dict) -> Job:
+    job = get_job(db, job_id)
+    if job.version != expected_version:
+        raise Conflict(STALE_VERSION)
+    if job.status in TERMINAL:
+        raise Conflict(f"Cannot edit a job that is {job.status.value}")
+    try:
+        update_details(job, expected_version, **fields)
+    except StaleJob:
+        db.rollback()
+        raise Conflict(STALE_VERSION) from None
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def delete_job(db: Session, job_id: int) -> None:
+    """Only a draft can go: nobody has been offered it and it has no history.
+    Any later job is cancelled instead, which keeps its audit trail and hours."""
+    job = get_job(db, job_id)
+    if job.status is not JobStatus.draft:
+        raise Conflict(f"Cannot delete a job that is {job.status.value}; cancel it instead")
+    deleted = _conditional_update(
+        db, delete(Job).where(Job.id == job_id, Job.status == JobStatus.draft)
+    )
+    if deleted != 1:
+        db.rollback()
+        raise Conflict("Job status changed concurrently")
+    db.commit()
+
+
+def list_worker_jobs(
+    db: Session, worker_id: int, limit: int = 50, offset: int = 0
+) -> Sequence[Job]:
+    return db.scalars(
+        select(Job)
+        .where(Job.assigned_worker_id == worker_id)
+        .order_by(Job.id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
 
 
 def list_jobs(
@@ -348,32 +412,40 @@ conditional_update = _conditional_update  # for the other services' race guards
 
 
 def transition_job(
-    db: Session, job_id: int, target: JobStatus, *, now: datetime | None = None
+    db: Session,
+    job_id: int,
+    target: JobStatus,
+    *,
+    actor_id: int | None = None,
+    expected_version: int | None = None,
+    now: datetime | None = None,
 ) -> Job:
     now = now or utcnow()
     job = db.get(Job, job_id)
     if job is None:
         raise NotFound("Job not found")
+    # Before the transition check: someone holding an old copy should be told
+    # to reload, not that their move is illegal for a status they never saw.
+    if expected_version is not None and job.version != expected_version:
+        raise Conflict(STALE_VERSION)
     current = job.status
     if target not in MANUAL_TRANSITIONS.get(current, frozenset()):
         raise InvalidTransition(f"Cannot change job status from {current.value} to {target.value}")
 
-    values: dict = {"status": target}
-    if target is JobStatus.offering:
+    values: dict = {}
+    if target is JobStatus.dispatching:
         values["offer_round"] = 1
-    # Conditional on the status we validated against: a concurrent accept or
-    # second PATCH that got there first leaves rowcount 0.
-    claimed = _conditional_update(
-        db, update(Job).where(Job.id == job_id, Job.status == current).values(**values)
-    )
-    if claimed != 1:
+    # Conditional on what we validated against: a concurrent accept or second
+    # PATCH that got there first leaves the job unmatched.
+    try:
+        transition(job, target, actor_id, expected_version=expected_version, **values)
+    except StaleJob:
         db.rollback()
-        raise Conflict("Job status changed concurrently")
-    db.refresh(job)
+        raise Conflict("Job status changed concurrently") from None
 
     company_id = job.company_id
     events: list[tuple[int, OfferEvent]] = []
-    if target is JobStatus.offering:
+    if target is JobStatus.dispatching:
         events = _created_events(db, job, create_offers(db, job, now=now))
     elif target is JobStatus.cancelled:
         events = _closed_events("offer.expired", _expire_pending(db, job_id))
@@ -390,8 +462,8 @@ def create_offers(
     db: Session, job: Job, limit: int | None = None, *, now: datetime | None = None
 ) -> list[JobOffer]:
     """Offer ``job`` to the next ``limit`` (default: ring size) nearest
-    workers not yet offered it. No-op unless the job is offering."""
-    if job.status is not JobStatus.offering:
+    workers not yet offered it. No-op unless the job is dispatching."""
+    if job.status is not JobStatus.dispatching:
         return []
     now = now or utcnow()
     limit = settings.DISPATCH_RING_SIZE if limit is None else limit
@@ -456,8 +528,8 @@ def _refuse_unavailable(offer: JobOffer, job: Job, now: datetime) -> None:
         raise Conflict("Offer already declined")
     if offer.status is OfferStatus.expired or offer.expires_at <= now:
         raise Gone("Offer expired")
-    if job.status is not JobStatus.offering:
-        raise Conflict("Job is no longer offering")
+    if job.status is not JobStatus.dispatching:
+        raise Conflict("Job is no longer dispatching")
 
 
 def accept_offer(
@@ -471,19 +543,17 @@ def accept_offer(
     # The race guard. Two workers holding distinct pending offers for this
     # job both get here; the database applies these UPDATEs one at a time and
     # re-checks the WHERE, so only the first claims the job.
-    claimed = _conditional_update(
-        db,
-        update(Job)
-        .where(
-            Job.id == offer.job_id,
-            Job.status == JobStatus.offering,
-            Job.assigned_worker_id.is_(None),
+    try:
+        transition(
+            job,
+            JobStatus.assigned,
+            worker_id,
+            guards=(Job.assigned_worker_id.is_(None),),
+            assigned_worker_id=worker_id,
         )
-        .values(status=JobStatus.assigned, assigned_worker_id=worker_id),
-    )
-    if claimed != 1:
+    except (StaleJob, IllegalTransition):
         db.rollback()
-        raise Conflict("Job already assigned")
+        raise Conflict("Job already assigned") from None
     accepted = _conditional_update(
         db,
         update(JobOffer)
@@ -544,7 +614,7 @@ def decline_offer(
     db.refresh(job)
     company_id = job.company_id
     events: list[tuple[int, OfferEvent]] = []
-    if job.status is JobStatus.offering:
+    if job.status is JobStatus.dispatching:
         offers = create_offers(
             db, job, settings.DISPATCH_RING_SIZE - pending_offer_count(db, job.id), now=now
         )
@@ -560,15 +630,20 @@ def decline_offer(
 
 def upsert_location(db: Session, worker_id: int, lat: float, lng: float) -> WorkerLocation:
     def _apply() -> WorkerLocation:
+        seen_at = utcnow()
         location = db.scalars(
             select(WorkerLocation).where(WorkerLocation.worker_id == worker_id)
         ).one_or_none()
         if location is None:
-            location = WorkerLocation(worker_id=worker_id, lat=lat, lng=lng)
+            location = WorkerLocation(worker_id=worker_id, lat=lat, lng=lng, updated_at=seen_at)
             db.add(location)
         else:
             location.lat, location.lng = lat, lng
-            location.updated_at = utcnow()
+            location.updated_at = seen_at
+        # Same transaction, so the profile can never disagree with matching.
+        profile = db.get(WorkerProfile, worker_id)
+        if profile is not None:
+            profile.last_lat, profile.last_lng, profile.last_seen_at = lat, lng, seen_at
         db.commit()
         return location
 
@@ -587,7 +662,7 @@ def upsert_location(db: Session, worker_id: int, lat: float, lng: float) -> Work
 @dataclass(frozen=True)
 class ExpirySweep:
     expired_count: int
-    # Offering jobs left with no pending offer: candidates for re_offer_job.
+    # Dispatching jobs left with no pending offer: candidates for re_offer_job.
     job_ids: list[int]
     closed: list[ClosedOffer]
 
@@ -603,7 +678,7 @@ def check_offer_expiry(
     db: Session, company_id: int, *, now: datetime | None = None
 ) -> ExpirySweep:
     """Mark the company's pending offers past ``expires_at`` expired and
-    list its offering jobs that now have no pending offer."""
+    list its dispatching jobs that now have no pending offer."""
     now = now or utcnow()
     closed = _expire_returning(
         db,
@@ -620,20 +695,18 @@ def check_offer_expiry(
     )
     job_ids = db.scalars(
         select(Job.id)
-        .where(Job.company_id == company_id, Job.status == JobStatus.offering, ~has_pending)
+        .where(Job.company_id == company_id, Job.status == JobStatus.dispatching, ~has_pending)
         .order_by(Job.id)
     ).all()
     return ExpirySweep(len(closed), list(job_ids), closed)
 
 
 def _mark_unfilled(db: Session, job: Job) -> None:
-    _conditional_update(
-        db,
-        update(Job)
-        .where(Job.id == job.id, Job.status == JobStatus.offering)
-        .values(status=JobStatus.unfilled),
-    )
-    db.refresh(job)
+    try:
+        transition(job, JobStatus.unfilled, None)
+    except StaleJob:
+        # Accepted or cancelled since the read: that outcome stands.
+        db.refresh(job)
 
 
 def re_offer_job(
@@ -644,13 +717,13 @@ def re_offer_job(
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Offer an offering job with no pending offers to the next ring of
+    """Offer a dispatching job with no pending offers to the next ring of
     workers never offered it before, and count the round.
 
     Bounded: once ``offer_round`` reaches ``max_rounds``, or nobody new is in
     range, the job becomes ``unfilled`` (terminal) and False is returned.
     """
-    if job.status is not JobStatus.offering or pending_offer_count(db, job.id):
+    if job.status is not JobStatus.dispatching or pending_offer_count(db, job.id):
         return False
     ring_size = settings.DISPATCH_RING_SIZE if ring_size is None else ring_size
     max_rounds = settings.DISPATCH_MAX_ROUNDS if max_rounds is None else max_rounds

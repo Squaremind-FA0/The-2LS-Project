@@ -92,7 +92,7 @@ def test_worker_profile_trades_round_trip_a_list(transactional_db):
         db.add(profile)
         db.flush()
         db.expire_all()
-        assert db.get(WorkerProfile, profile.id).trades == ["plumbing", "gas"]
+        assert db.get(WorkerProfile, profile.user_id).trades == ["plumbing", "gas"]
 
 
 def test_revocation_helpers_bump_token_version(transactional_db):

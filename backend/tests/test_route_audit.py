@@ -153,9 +153,17 @@ def _roles(route: EffectiveRoute) -> set[str]:
 
 def test_dispatch_routes_require_the_prp_roles():
     expected = {
-        ("POST", "/api/jobs"): {"dispatcher"},
+        ("POST", "/api/jobs"): {"dispatcher", "company_admin"},
         ("GET", "/api/jobs"): {"dispatcher", "company_admin"},
-        ("PATCH", "/api/jobs/{job_id}"): {"dispatcher"},
+        ("GET", "/api/jobs/{job_id}"): {"dispatcher", "company_admin"},
+        ("PATCH", "/api/jobs/{job_id}"): {"dispatcher", "company_admin"},
+        ("DELETE", "/api/jobs/{job_id}"): {"dispatcher", "company_admin"},
+        ("POST", "/api/jobs/{job_id}/cancel"): {"dispatcher", "company_admin"},
+        ("PATCH", "/api/me/location"): {"worker"},
+        ("PATCH", "/api/me/availability"): {"worker"},
+        ("GET", "/api/me/jobs"): {"worker"},
+        ("POST", "/api/me/jobs/{job_id}/start"): {"worker"},
+        ("POST", "/api/me/jobs/{job_id}/complete"): {"worker"},
         ("PUT", "/api/workers/me/location"): {"worker"},
         ("GET", "/api/offers/pending"): {"worker"},
         ("POST", "/api/offers/{offer_id}/accept"): {"worker"},

@@ -14,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.domain.job_state import IllegalTransition, StaleJob, transition
 from app.models import Job, JobStatus, Shift, TimeEntry
 from app.models.job import utcnow
 from app.services.dispatch import Conflict, NotFound, conditional_update
@@ -48,19 +49,16 @@ def clock_in(db: Session, job_id: int, worker_id: int, *, now: datetime | None =
     if not _is_on_shift(db, worker_id, now):
         raise Conflict("Worker is not on shift")
 
-    claimed = conditional_update(
-        db,
-        update(Job)
-        .where(
-            Job.id == job_id,
-            Job.status == JobStatus.assigned,
-            Job.assigned_worker_id == worker_id,
+    try:
+        transition(
+            job,
+            JobStatus.in_progress,
+            worker_id,
+            guards=(Job.assigned_worker_id == worker_id,),
         )
-        .values(status=JobStatus.in_progress),
-    )
-    if claimed != 1:
+    except (StaleJob, IllegalTransition):
         db.rollback()
-        raise Conflict("Job status changed concurrently")
+        raise Conflict("Job status changed concurrently") from None
     entry = TimeEntry(job_id=job_id, worker_id=worker_id, started_at=now)
     db.add(entry)
     try:
@@ -102,12 +100,11 @@ def clock_out(
     if closed != 1:
         db.rollback()
         raise Conflict("TimeEntry already ended")
-    conditional_update(
-        db,
-        update(Job)
-        .where(Job.id == job_id, Job.status == JobStatus.in_progress)
-        .values(status=JobStatus.completed),
-    )
+    if job.status is JobStatus.in_progress:
+        try:
+            transition(job, JobStatus.completed, worker_id)
+        except StaleJob:
+            pass  # moved on since the read; the dispatcher's status stands
     db.commit()
     db.refresh(entry)
     return entry

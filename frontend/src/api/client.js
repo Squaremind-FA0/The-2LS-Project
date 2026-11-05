@@ -105,8 +105,8 @@ export const workers = {
 export const jobs = {
   create: (payload) => apiRequest('/jobs', { method: 'POST', json: payload }),
   list: (params) => apiRequest(withQuery('/jobs', params)),
-  transition: (jobId, status) =>
-    apiRequest(`/jobs/${id(jobId)}`, { method: 'PATCH', json: { status } }),
+  transition: (jobId, status, version) =>
+    apiRequest(`/jobs/${id(jobId)}`, { method: 'PATCH', json: { version, status } }),
   clockIn: (jobId) => apiRequest(`/jobs/${id(jobId)}/clock-in`, { method: 'POST' }),
   clockOut: (jobId) => apiRequest(`/jobs/${id(jobId)}/clock-out`, { method: 'POST' }),
 };

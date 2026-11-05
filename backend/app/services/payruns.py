@@ -20,7 +20,6 @@ import io
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from datetime import date, datetime, time, timedelta
-from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
@@ -62,10 +61,6 @@ _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 # --- pure money rules -----------------------------------------------------------------------
 
 
-def rate_to_cents(hourly_rate: Decimal) -> int:
-    return int((hourly_rate * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
-
-
 def amount_cents(minutes_worked: int, hourly_rate_cents: int) -> int:
     """``minutes * rate / 60`` rounded half up: floor(x + 1/2) over integers."""
     return (minutes_worked * hourly_rate_cents + 30) // 60
@@ -93,7 +88,7 @@ def compute_paylines(db: Session, payrun: PayRun) -> None:
     worked = _worked_by_worker(db, payrun.period_start, payrun.period_end)
     rates = dict(
         db.execute(
-            select(WorkerProfile.user_id, WorkerProfile.hourly_rate).where(
+            select(WorkerProfile.user_id, WorkerProfile.hourly_rate_cents).where(
                 WorkerProfile.user_id.in_(list(worked))
             )
         ).all()
@@ -104,7 +99,7 @@ def compute_paylines(db: Session, payrun: PayRun) -> None:
             db.rollback()
             raise Conflict(f"Worker {worker_id} has no hourly rate")
         minutes = duration // timedelta(minutes=1)
-        rate_cents = rate_to_cents(rates[worker_id])
+        rate_cents = rates[worker_id]
         db.add(
             PayLine(
                 payrun_id=payrun.id,

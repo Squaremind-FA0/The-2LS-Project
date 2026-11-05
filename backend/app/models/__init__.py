@@ -2,6 +2,7 @@ from app.db import Base
 from app.models.audit_log import AuditLog
 from app.models.company import Company
 from app.models.job import Job, JobStatus
+from app.models.job_event import JobEvent
 from app.models.job_offer import JobOffer, OfferStatus
 from app.models.payline import PayLine
 from app.models.payrun import PayRun, PayRunStatus
@@ -17,6 +18,7 @@ __all__ = [
     "Base",
     "Company",
     "Job",
+    "JobEvent",
     "JobOffer",
     "JobStatus",
     "OfferStatus",
