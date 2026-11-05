@@ -11,7 +11,8 @@ export const USERS = {
 
 /** Render `ui` inside a controlled auth context and a MemoryRouter. */
 export function renderWithAuth(ui, { user = null, route = '/', auth = {} } = {}) {
-  const value = { user, loading: false, login: async () => {}, logout: () => {}, ...auth };
+  const token = user ? 'test-token' : null;
+  const value = { token, user, loading: false, login: async () => {}, logout: () => {}, ...auth };
   return render(
     <AuthContext.Provider value={value}>
       <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
