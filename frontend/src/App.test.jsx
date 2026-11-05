@@ -15,6 +15,7 @@ function renderAt(path, user = null) {
     'GET /me': { body: user ?? {} },
     'GET /jobs': { body: [] },
     'GET /offers/pending': { body: [] },
+    'GET /shifts': { body: [] },
   });
   return render(<App />);
 }
