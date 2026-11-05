@@ -35,6 +35,7 @@ from app.models import (
     JobStatus,
     OfferStatus,
     Role,
+    Shift,
     User,
     WorkerLocation,
     WorkerProfile,
@@ -135,18 +136,30 @@ def find_nearby_workers(
     limit: int | None = None,
     now: datetime | None = None,
 ) -> list[User]:
-    """Active workers of the job's company with the job's trade, a location
-    fresher than ``max_staleness_minutes`` and within ``max_distance_km``,
-    nearest first. Workers already offered this job (any status) are
-    excluded, so re-offering always reaches new workers."""
+    """Active workers of the job's company with the job's trade, on shift at
+    ``now``, with a location fresher than ``max_staleness_minutes`` and within
+    ``max_distance_km``, nearest first. Workers already offered this job (any
+    status) are excluded, so re-offering always reaches new workers."""
     if max_distance_km is None:
         max_distance_km = settings.DISPATCH_RADIUS_KM
     if max_staleness_minutes is None:
         max_staleness_minutes = settings.DISPATCH_LOCATION_MAX_AGE_MIN
-    cutoff = (now or utcnow()) - timedelta(minutes=max_staleness_minutes)
+    now = now or utcnow()
+    cutoff = now - timedelta(minutes=max_staleness_minutes)
     box = bounding_box(job.lat, job.lng, max_distance_km)
 
     already_offered = select(JobOffer.worker_id).where(JobOffer.job_id == job.id)
+    # EXISTS, not a join: a worker's row must not multiply with their shifts.
+    on_shift = (
+        select(Shift.id)
+        .where(
+            Shift.worker_id == User.id,
+            Shift.company_id == job.company_id,
+            Shift.starts_at <= now,
+            Shift.ends_at > now,
+        )
+        .exists()
+    )
     stmt = (
         select(User, WorkerProfile.trades, WorkerLocation.lat, WorkerLocation.lng)
         .join(WorkerProfile, WorkerProfile.user_id == User.id)
@@ -161,6 +174,7 @@ def find_nearby_workers(
         .where(WorkerLocation.updated_at >= cutoff)
         .where(WorkerLocation.lat.between(box.min_lat, box.max_lat))
         .where(User.id.not_in(already_offered))
+        .where(on_shift)
     )
     if box.min_lng is not None:
         stmt = stmt.where(WorkerLocation.lng.between(box.min_lng, box.max_lng))
@@ -202,6 +216,14 @@ class Conflict(DispatchError):
 
 class Gone(DispatchError):
     detail = "Offer expired"
+
+
+class BadRequest(DispatchError):
+    pass
+
+
+class Forbidden(DispatchError):
+    pass
 
 
 # --- offer views and events ---------------------------------------------------------------
@@ -290,10 +312,14 @@ def list_pending_offers(
 # --- jobs ---------------------------------------------------------------------------------
 
 # Dispatcher-driven transitions (PATCH). offering -> assigned happens only via
-# accept_offer, offering -> unfilled only via the sweeper.
+# accept_offer, offering -> unfilled only via the sweeper. Workers drive
+# assigned -> in_progress -> completed with app.services.time_entries, which
+# also records the time worked; these PATCH paths record none.
 MANUAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.draft: frozenset({JobStatus.offering, JobStatus.cancelled}),
     JobStatus.offering: frozenset({JobStatus.cancelled}),
+    JobStatus.assigned: frozenset({JobStatus.in_progress, JobStatus.cancelled}),
+    JobStatus.in_progress: frozenset({JobStatus.completed, JobStatus.cancelled}),
 }
 
 
@@ -316,6 +342,9 @@ def list_jobs(
 def _conditional_update(db: Session, stmt) -> int:
     """Run an ORM UPDATE (tenant-scoped by the listener) and return rowcount."""
     return db.execute(stmt.execution_options(synchronize_session=False)).rowcount
+
+
+conditional_update = _conditional_update  # for the other services' race guards
 
 
 def transition_job(

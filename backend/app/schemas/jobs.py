@@ -40,7 +40,7 @@ class JobCreateRequest(BaseModel):
 class JobStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    status: Literal["offering", "cancelled", "draft"]
+    status: Literal["offering", "cancelled", "draft", "in_progress", "completed"]
 
 
 class JobOut(BaseModel):

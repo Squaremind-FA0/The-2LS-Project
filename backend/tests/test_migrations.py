@@ -106,3 +106,57 @@ def test_0003_creates_dispatch_schema_and_downgrades_to_0002(tmp_path):
         assert G3_TABLES <= set(inspect(engine).get_table_names())
     finally:
         engine.dispose()
+
+
+G5_TABLES = {"shifts", "time_entries", "payruns", "paylines", "audit_logs"}
+
+
+def test_0004_creates_roster_payroll_schema_and_downgrades_to_0003(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'g5.db'}"
+    engine = create_engine(db_url)
+    try:
+        _alembic(db_url, "upgrade", "head")
+        insp = inspect(engine)
+        assert G5_TABLES <= set(insp.get_table_names())
+
+        def index_cols(table):
+            return {ix["name"]: tuple(ix["column_names"]) for ix in insp.get_indexes(table)}
+
+        assert index_cols("shifts")["ix_shifts_company_worker_window"] == (
+            "company_id", "worker_id", "starts_at", "ends_at",
+        )
+        entries = index_cols("time_entries")
+        assert entries["ix_time_entries_company_job"] == ("company_id", "job_id")
+        assert entries["ix_time_entries_company_worker"] == ("company_id", "worker_id")
+        assert index_cols("payruns")["ix_payruns_company_status"] == ("company_id", "status")
+        assert index_cols("paylines")["ix_paylines_company_payrun_worker"] == (
+            "company_id", "payrun_id", "worker_id",
+        )
+        assert index_cols("audit_logs")["ix_audit_logs_company_entity"] == (
+            "company_id", "entity_type", "entity_id",
+        )
+
+        def uniques(table):
+            return {tuple(u["column_names"]) for u in insp.get_unique_constraints(table)}
+
+        assert ("job_id",) in uniques("time_entries")
+        assert ("payrun_id", "worker_id") in uniques("paylines")
+
+        # Money is whole cents and whole minutes, never a float or Numeric.
+        cols = {c["name"]: c["type"] for c in insp.get_columns("paylines")}
+        for name in ("minutes_worked", "hourly_rate_cents", "amount_cents"):
+            assert cols[name].python_type is int
+
+        _alembic(db_url, "check")
+
+        _alembic(db_url, "downgrade", "0003")
+        engine.dispose()
+        remaining = set(inspect(engine).get_table_names())
+        assert not G5_TABLES & remaining
+        assert G3_TABLES <= remaining
+
+        _alembic(db_url, "upgrade", "head")
+        engine.dispose()
+        assert G5_TABLES <= set(inspect(engine).get_table_names())
+    finally:
+        engine.dispose()

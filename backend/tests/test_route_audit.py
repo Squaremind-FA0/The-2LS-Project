@@ -132,6 +132,15 @@ def test_audit_actually_sees_the_api_routes():
         "/api/dispatch/sweep",
         "/api/ws/worker",
     } <= guarded
+    assert {
+        "/api/shifts",
+        "/api/jobs/{job_id}/clock-in",
+        "/api/jobs/{job_id}/clock-out",
+        "/api/payruns",
+        "/api/payruns/{payrun_id}",
+        "/api/payruns/{payrun_id}/paylines",
+        "/api/payruns/{payrun_id}/export",
+    } <= guarded
 
 
 def _roles(route: EffectiveRoute) -> set[str]:
@@ -172,6 +181,27 @@ def test_ws_worker_route_requires_the_worker_role():
         for role in getattr(dep.call, REQUIRE_WS_ROLE_MARKER, ())
     }
     assert roles == {"worker"}
+
+
+def test_roster_and_payroll_routes_require_the_prp_roles():
+    expected = {
+        ("POST", "/api/shifts"): {"worker"},
+        ("GET", "/api/shifts"): {"worker"},
+        ("POST", "/api/jobs/{job_id}/clock-in"): {"worker"},
+        ("POST", "/api/jobs/{job_id}/clock-out"): {"worker"},
+        ("GET", "/api/payruns"): {"company_admin"},
+        ("POST", "/api/payruns"): {"company_admin"},
+        ("PATCH", "/api/payruns/{payrun_id}"): {"company_admin"},
+        ("GET", "/api/payruns/{payrun_id}/paylines"): {"worker"},
+        ("GET", "/api/payruns/{payrun_id}/export"): {"company_admin"},
+    }
+    actual = {
+        (method, route.path): _roles(route)
+        for route in api_routes(app)
+        for method in route.methods
+        if (method, route.path) in expected
+    }
+    assert actual == expected
 
 
 # --- self-checks: the audit must be able to fail ------------------------------------------

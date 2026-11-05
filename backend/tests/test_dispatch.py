@@ -23,6 +23,7 @@ from app.models import (
     JobStatus,
     OfferStatus,
     Role,
+    Shift,
     User,
     WorkerLocation,
     WorkerProfile,
@@ -42,15 +43,34 @@ def north_of(lat: float, km: float) -> float:
 # --- data helpers -------------------------------------------------------------------------
 
 
-def add_worker(db, company_id, key, km=None, *, trades=("plumbing",), age=timedelta(0)):
-    """A worker (with profile) optionally located ``km`` north of the job."""
+def add_worker(
+    db, company_id, key, km=None, *, trades=("plumbing",), age=timedelta(0), on_shift=True
+):
+    """A worker (with profile) optionally located ``km`` north of the job.
+
+    On shift by default, because G5 only dispatches to workers on shift.
+    """
     ref = make_user(
         db, company_id, f"{key}@c{company_id}.test", WORKER_PASSWORD, Role.worker,
         trades=list(trades),
     )
+    if on_shift:
+        add_shift(db, company_id, ref.id)
     if km is not None:
         set_location(db, company_id, ref.id, north_of(JOB_LAT, km), JOB_LNG, age=age)
     return ref
+
+
+def add_shift(db, company_id, worker_id, *, start=None, end=None):
+    with tenant_context(db, company_id):
+        db.add(
+            Shift(
+                worker_id=worker_id,
+                starts_at=start or utcnow() - timedelta(days=1),
+                ends_at=end or utcnow() + timedelta(days=1),
+            )
+        )
+        db.flush()
 
 
 def set_location(db, company_id, worker_id, lat, lng, *, age=timedelta(0)):
@@ -418,7 +438,12 @@ def test_offering_transition_offers_nearest_ring(client, two_companies, transact
         (JobStatus.offering, "offering"),
         (JobStatus.offering, "draft"),
         (JobStatus.cancelled, "offering"),
-        (JobStatus.assigned, "cancelled"),
+        (JobStatus.assigned, "offering"),
+        (JobStatus.assigned, "completed"),
+        (JobStatus.in_progress, "offering"),
+        (JobStatus.completed, "in_progress"),
+        (JobStatus.completed, "cancelled"),
+        (JobStatus.cancelled, "in_progress"),
         (JobStatus.unfilled, "offering"),
     ],
 )
