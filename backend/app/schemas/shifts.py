@@ -26,3 +26,13 @@ class ShiftResponse(BaseModel):
     starts_at: datetime
     ends_at: datetime
     created_at: datetime
+
+
+class TimeEntryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    job_id: int
+    worker_id: int
+    started_at: datetime
+    ended_at: datetime | None

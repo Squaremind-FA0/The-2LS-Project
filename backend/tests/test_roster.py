@@ -4,8 +4,9 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
-from app.models import JobOffer, Shift
+from app.models import Job, JobOffer, JobStatus, Shift, TimeEntry
 from app.models.job import utcnow
 from tests import test_dispatch as td
 from tests.factories import auth_header, tenant_context
@@ -207,3 +208,269 @@ def test_on_shift_filter_uses_the_half_open_window(
     result = td.match_ids(transactional_db, a.id, job_id, now=now)
 
     assert result == ([worker.id] if matched else [])
+
+
+# --- Phase 3: job clock-in/out and state machine (tasks 13-19) ------------------------------
+
+
+def assigned_job(db, company_id, worker_id, status=JobStatus.assigned) -> int:
+    job_id = td.add_job(db, company_id, status=status)
+    with tenant_context(db, company_id):
+        db.get(Job, job_id).assigned_worker_id = worker_id
+        db.flush()
+    return job_id
+
+
+def on_shift_worker_job(db, company, status=JobStatus.assigned) -> int:
+    td.add_shift(db, company.id, company.worker.id)
+    return assigned_job(db, company.id, company.worker.id, status)
+
+
+def clock(client, action, job_id, user):
+    return client.post(f"/api/jobs/{job_id}/clock-{action}", headers=auth_header(user))
+
+
+def time_entries(db, company_id, job_id) -> list[TimeEntry]:
+    with tenant_context(db, company_id):
+        db.expire_all()
+        return list(db.scalars(select(TimeEntry).where(TimeEntry.job_id == job_id)))
+
+
+def test_clock_in_requires_assigned_and_moves_job_to_in_progress(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+
+    before = utcnow()
+    response = clock(client, "in", job_id, a.worker)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"id", "job_id", "worker_id", "started_at", "ended_at"}
+    assert (body["job_id"], body["worker_id"], body["ended_at"]) == (job_id, a.worker.id, None)
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.in_progress
+    entry = time_entries(transactional_db, a.id, job_id)[0]
+    assert before <= entry.started_at <= utcnow()
+
+
+@pytest.mark.parametrize(
+    "status",
+    [JobStatus.offering, JobStatus.in_progress, JobStatus.completed, JobStatus.cancelled],
+)
+def test_clock_in_refuses_a_job_that_is_not_assigned_status(
+    client, two_companies, transactional_db, status
+):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a, status)
+
+    assert clock(client, "in", job_id, a.worker).status_code == 409
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is status
+    assert time_entries(transactional_db, a.id, job_id) == []
+
+
+def test_clock_in_without_on_shift_shift_is_409(client, two_companies, transactional_db):
+    a, _ = two_companies
+    job_id = assigned_job(transactional_db, a.id, a.worker.id)
+    now = utcnow()
+    td.add_shift(transactional_db, a.id, a.worker.id, start=now - hours(3), end=now - hours(1))
+
+    response = clock(client, "in", job_id, a.worker)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Worker is not on shift"
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.assigned
+    assert time_entries(transactional_db, a.id, job_id) == []
+
+
+def test_another_workers_shift_does_not_put_this_worker_on_shift(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    td.add_worker(transactional_db, a.id, "colleague")  # on shift
+    job_id = assigned_job(transactional_db, a.id, a.worker.id)
+    assert clock(client, "in", job_id, a.worker).json()["detail"] == "Worker is not on shift"
+
+
+def test_clock_in_twice_is_409(client, two_companies, transactional_db):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    assert clock(client, "in", job_id, a.worker).status_code == 200
+
+    again = clock(client, "in", job_id, a.worker)
+
+    assert again.status_code == 409
+    assert again.json()["detail"] == "Job already has a TimeEntry"
+    assert len(time_entries(transactional_db, a.id, job_id)) == 1
+
+
+@pytest.mark.parametrize("action", ["in", "out"])
+def test_clock_is_refused_for_another_workers_job_and_hidden_across_companies(
+    client, two_companies, transactional_db, action
+):
+    a, b = two_companies
+    colleague = td.add_worker(transactional_db, a.id, "colleague")
+    job_id = on_shift_worker_job(transactional_db, a)
+
+    refused = clock(client, action, job_id, colleague)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "Job not assigned to this worker"
+    assert clock(client, action, job_id, b.worker).status_code == 404
+    assert clock(client, action, 999_999, a.worker).status_code == 404
+
+
+@pytest.mark.parametrize("role", ["admin", "dispatcher"])
+@pytest.mark.parametrize("action", ["in", "out"])
+def test_only_workers_clock(client, two_companies, transactional_db, action, role):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    assert clock(client, action, job_id, getattr(a, role)).status_code == 403
+
+
+def test_clock_out_requires_in_progress_and_moves_job_to_completed(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    started = clock(client, "in", job_id, a.worker).json()["started_at"]
+
+    response = clock(client, "out", job_id, a.worker)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["started_at"] == started
+    assert body["ended_at"] is not None
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.completed
+
+
+def test_clock_out_before_clock_in_is_404(client, two_companies, transactional_db):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    response = clock(client, "out", job_id, a.worker)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Job or TimeEntry not found"
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.assigned
+
+
+def test_clock_out_twice_is_409(client, two_companies, transactional_db):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    clock(client, "in", job_id, a.worker)
+    first = clock(client, "out", job_id, a.worker).json()["ended_at"]
+
+    again = clock(client, "out", job_id, a.worker)
+
+    assert again.status_code == 409
+    assert again.json()["detail"] == "TimeEntry already ended"
+    assert time_entries(transactional_db, a.id, job_id)[0].ended_at.isoformat() == first
+
+
+def test_clock_out_is_allowed_after_the_shift_ended(client, two_companies, transactional_db):
+    a, _ = two_companies
+    job_id = assigned_job(transactional_db, a.id, a.worker.id, JobStatus.in_progress)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.add(
+            TimeEntry(job_id=job_id, worker_id=a.worker.id, started_at=utcnow() - hours(1))
+        )
+        transactional_db.flush()
+    assert clock(client, "out", job_id, a.worker).status_code == 200
+
+
+def test_clock_out_of_a_job_cancelled_mid_work_keeps_the_hours_and_the_status(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    clock(client, "in", job_id, a.worker)
+    cancel = client.patch(
+        f"/api/jobs/{job_id}", json={"status": "cancelled"}, headers=auth_header(a.dispatcher)
+    )
+    assert cancel.status_code == 200
+
+    response = clock(client, "out", job_id, a.worker)
+
+    assert response.status_code == 200 and response.json()["ended_at"] is not None
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.cancelled
+
+
+@pytest.mark.parametrize(
+    ("start", "target"),
+    [
+        (JobStatus.assigned, "in_progress"),
+        (JobStatus.assigned, "cancelled"),
+        (JobStatus.in_progress, "completed"),
+        (JobStatus.in_progress, "cancelled"),
+    ],
+)
+def test_dispatcher_can_drive_the_extended_transitions(
+    client, two_companies, transactional_db, start, target
+):
+    a, _ = two_companies
+    job_id = assigned_job(transactional_db, a.id, a.worker.id, start)
+    response = client.patch(
+        f"/api/jobs/{job_id}", json={"status": target}, headers=auth_header(a.dispatcher)
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == target
+
+
+def test_db_rejects_a_second_time_entry_for_a_job(transactional_db, two_companies):
+    a, _ = two_companies
+    job_id = assigned_job(transactional_db, a.id, a.worker.id, JobStatus.in_progress)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.add_all(
+            [TimeEntry(job_id=job_id, worker_id=a.worker.id, started_at=utcnow()) for _ in "ab"]
+        )
+        with pytest.raises(IntegrityError):
+            transactional_db.flush()
+        transactional_db.rollback()
+
+
+def test_concurrent_clock_in_only_one_wins(db_file_based, file_company):
+    with db_file_based() as db:
+        job_id = on_shift_worker_job(db, file_company)
+        db.commit()
+    url = f"/api/jobs/{job_id}/clock-in"
+    responses = td.fire([("POST", url, {"headers": auth_header(file_company.worker)})] * 4)
+    assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
+    with db_file_based() as db:
+        assert len(time_entries(db, file_company.id, job_id)) == 1
+
+
+def test_concurrent_clock_out_only_one_wins(db_file_based, file_company):
+    with db_file_based() as db:
+        job_id = assigned_job(db, file_company.id, file_company.worker.id, JobStatus.in_progress)
+        with tenant_context(db, file_company.id):
+            db.add(
+                TimeEntry(
+                    job_id=job_id, worker_id=file_company.worker.id, started_at=utcnow() - hours(1)
+                )
+            )
+            db.commit()
+    url = f"/api/jobs/{job_id}/clock-out"
+    responses = td.fire([("POST", url, {"headers": auth_header(file_company.worker)})] * 4)
+    assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
+
+
+def test_e2e_shift_offer_accept_clock_in_and_out(client, two_companies, transactional_db):
+    a, _ = two_companies
+    headers = auth_header(a.worker)
+    now = utcnow()
+    assert post_shift(client, a.worker, now - hours(1), now + hours(8)).status_code == 201
+    located = client.put(
+        "/api/workers/me/location", json={"lat": td.JOB_LAT, "lng": td.JOB_LNG}, headers=headers
+    )
+    assert located.status_code == 200
+    created = client.post(
+        "/api/jobs", json=td.job_body(trade="a"), headers=auth_header(a.dispatcher)
+    )
+    job_id = created.json()["id"]
+    assert td.start_offering(client, a.dispatcher, job_id).status_code == 200
+    offer = td.offers_for(transactional_db, a.id, job_id)[a.worker.id]
+
+    assert client.post(f"/api/offers/{offer.id}/accept", headers=headers).status_code == 200
+    assert clock(client, "in", job_id, a.worker).status_code == 200
+    assert clock(client, "out", job_id, a.worker).status_code == 200
+
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.completed
+    assert time_entries(transactional_db, a.id, job_id)[0].ended_at is not None

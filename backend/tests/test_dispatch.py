@@ -438,7 +438,12 @@ def test_offering_transition_offers_nearest_ring(client, two_companies, transact
         (JobStatus.offering, "offering"),
         (JobStatus.offering, "draft"),
         (JobStatus.cancelled, "offering"),
-        (JobStatus.assigned, "cancelled"),
+        (JobStatus.assigned, "offering"),
+        (JobStatus.assigned, "completed"),
+        (JobStatus.in_progress, "offering"),
+        (JobStatus.completed, "in_progress"),
+        (JobStatus.completed, "cancelled"),
+        (JobStatus.cancelled, "in_progress"),
         (JobStatus.unfilled, "offering"),
     ],
 )

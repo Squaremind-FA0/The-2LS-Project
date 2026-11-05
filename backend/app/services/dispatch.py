@@ -312,10 +312,14 @@ def list_pending_offers(
 # --- jobs ---------------------------------------------------------------------------------
 
 # Dispatcher-driven transitions (PATCH). offering -> assigned happens only via
-# accept_offer, offering -> unfilled only via the sweeper.
+# accept_offer, offering -> unfilled only via the sweeper. Workers drive
+# assigned -> in_progress -> completed with app.services.time_entries, which
+# also records the time worked; these PATCH paths record none.
 MANUAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.draft: frozenset({JobStatus.offering, JobStatus.cancelled}),
     JobStatus.offering: frozenset({JobStatus.cancelled}),
+    JobStatus.assigned: frozenset({JobStatus.in_progress, JobStatus.cancelled}),
+    JobStatus.in_progress: frozenset({JobStatus.completed, JobStatus.cancelled}),
 }
 
 
@@ -338,6 +342,9 @@ def list_jobs(
 def _conditional_update(db: Session, stmt) -> int:
     """Run an ORM UPDATE (tenant-scoped by the listener) and return rowcount."""
     return db.execute(stmt.execution_options(synchronize_session=False)).rowcount
+
+
+conditional_update = _conditional_update  # for the other services' race guards
 
 
 def transition_job(
