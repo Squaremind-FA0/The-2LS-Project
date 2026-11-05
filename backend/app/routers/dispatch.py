@@ -24,6 +24,8 @@ _STATUS_FOR = {
     service.InvalidTransition: status.HTTP_400_BAD_REQUEST,
     service.Conflict: status.HTTP_409_CONFLICT,
     service.Gone: status.HTTP_410_GONE,
+    service.BadRequest: status.HTTP_400_BAD_REQUEST,
+    service.Forbidden: status.HTTP_403_FORBIDDEN,
 }
 
 

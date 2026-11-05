@@ -204,6 +204,14 @@ class Gone(DispatchError):
     detail = "Offer expired"
 
 
+class BadRequest(DispatchError):
+    pass
+
+
+class Forbidden(DispatchError):
+    pass
+
+
 # --- offer views and events ---------------------------------------------------------------
 #
 # Commit-then-notify: events are BUILT before db.commit() (no query after the
