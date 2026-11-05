@@ -2,9 +2,13 @@
 commit-then-notify, polling fallback and the socket itself.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
+from app.auth.deps import ws_principal
 from app.schemas.jobs import OfferClosedEvent, OfferCreatedEvent
+from app.security.tokens import create_access_token
 
 # --- Phase 1: contract ---------------------------------------------------------------------
 
@@ -37,3 +41,19 @@ def test_offer_created_event_json_contract():
         OfferClosedEvent(type=kind, offer_id=7, job_id=3)
     with pytest.raises(ValueError):
         OfferClosedEvent(type="offer.created", offer_id=7, job_id=3)
+
+
+# --- Phase 2: auth and route audit ----------------------------------------------------------
+
+
+def test_ws_principal_always_closes_the_session():
+    db = MagicMock()
+    assert ws_principal(db, "not-a-real-token") is None
+    db.close.assert_called_once()
+
+    db2 = MagicMock()
+    db2.scalars.side_effect = RuntimeError("boom")
+    valid_token = create_access_token(999, 0)
+    with pytest.raises(RuntimeError):
+        ws_principal(db2, valid_token)
+    db2.close.assert_called_once()

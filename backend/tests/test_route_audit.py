@@ -7,17 +7,19 @@ allowlist.
 
 from dataclasses import dataclass
 
-from fastapi import APIRouter, Depends, FastAPI, routing
+from fastapi import APIRouter, Depends, FastAPI, WebSocket, routing
 from fastapi.dependencies.models import Dependant
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from sqlalchemy.orm import Session
 
 from app.auth.deps import (
     ALL_ROLES,
     PUBLIC_API_PATHS,
     REQUIRE_ROLE_MARKER,
+    REQUIRE_WS_ROLE_MARKER,
     get_tenant_db,
     require_role,
+    require_ws_role,
 )
 from app.db import get_db
 from app.main import app
@@ -81,6 +83,15 @@ def api_routes(application: FastAPI) -> list[EffectiveRoute]:
 def audit_routes(application: FastAPI, public: frozenset[str] = PUBLIC_API_PATHS) -> list[str]:
     violations = []
     for route in api_routes(application):
+        if isinstance(route.original, APIWebSocketRoute):
+            # Checked before the allowlist: a socket is never public. No
+            # get_tenant_db here: it needs a bearer header, and a socket must
+            # not hold a session open. WS handlers never read tenant data.
+            if route.dependant is None or not any(
+                hasattr(dep.call, REQUIRE_WS_ROLE_MARKER) for dep in _walk(route.dependant)
+            ):
+                violations.append(f"WS {route.path}: missing require_ws_role(...)")
+            continue
         if not isinstance(route.original, APIRoute) or route.dependant is None:
             # A Mount / sub-app under /api would bypass this whole audit.
             kind = type(route.original).__name__
@@ -218,3 +229,38 @@ def test_audit_does_not_exempt_paths_outside_the_allowlist():
         return {}
 
     assert audit_routes(leaky) == ["POST /api/auth/register: missing require_role(...)"]
+
+
+def test_audit_flags_a_websocket_route_without_ws_auth():
+    leaky = FastAPI()
+
+    @leaky.websocket("/api/ws/leak")
+    async def leak(websocket: WebSocket):
+        await websocket.accept()
+
+    assert audit_routes(leaky) == ["WS /api/ws/leak: missing require_ws_role(...)"]
+
+
+def test_audit_accepts_a_websocket_route_with_ws_auth_through_a_router():
+    ok = FastAPI()
+    router = APIRouter()
+
+    @router.websocket("/api/ws/fine")
+    async def fine(websocket: WebSocket, principal=Depends(require_ws_role(*ALL_ROLES))):
+        pass
+
+    ok.include_router(router)
+    assert audit_routes(ok) == []
+
+
+def test_public_allowlist_cannot_exempt_a_websocket_route():
+    leaky = FastAPI()
+
+    @leaky.websocket("/api/ws/leak")
+    async def leak(websocket: WebSocket):
+        await websocket.accept()
+
+    allowlist = frozenset({"/api/ws/leak"})
+    assert audit_routes(leaky, public=allowlist) == [
+        "WS /api/ws/leak: missing require_ws_role(...)"
+    ]
