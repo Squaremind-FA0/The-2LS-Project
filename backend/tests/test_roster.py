@@ -5,7 +5,8 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select
 
-from app.models import Shift
+from app.models import JobOffer, Shift
+from app.models.job import utcnow
 from tests import test_dispatch as td
 from tests.factories import auth_header, tenant_context
 
@@ -158,3 +159,51 @@ def test_concurrent_overlapping_shifts_only_one_wins(db_file_based, file_company
         [("POST", "/api/shifts", {"json": body, "headers": auth_header(file_company.worker)})] * 4
     )
     assert sorted(r.status_code for r in responses) == [201, 409, 409, 409]
+
+
+# --- Phase 2: on-shift dispatch filter (tasks 11-12) ----------------------------------------
+
+
+def test_off_shift_worker_is_never_offered_even_if_nearest(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    off_shift = td.add_worker(transactional_db, a.id, "offshift", 0.5, on_shift=False)
+    on_shift = td.add_worker(transactional_db, a.id, "onshift", 5.0)
+    job_id = td.add_job(transactional_db, a.id)
+
+    assert td.match_ids(transactional_db, a.id, job_id) == [on_shift.id]
+
+    assert td.start_offering(client, a.dispatcher, job_id).status_code == 200
+    with tenant_context(transactional_db, a.id):
+        offered = transactional_db.scalars(
+            select(JobOffer.worker_id).where(JobOffer.job_id == job_id)
+        ).all()
+    assert off_shift.id not in offered
+    assert offered == [on_shift.id]
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "matched"),
+    [
+        (-1, 1, True),  # covers now
+        (0, 1, True),  # starts_at is inclusive
+        (-1, 0, False),  # ends_at is exclusive
+        (-3, -1, False),  # already over
+        (1, 3, False),  # not started
+    ],
+)
+def test_on_shift_filter_uses_the_half_open_window(
+    transactional_db, two_companies, start, end, matched
+):
+    a, _ = two_companies
+    now = utcnow()
+    worker = td.add_worker(transactional_db, a.id, "boundary", 1.0, on_shift=False)
+    td.add_shift(
+        transactional_db, a.id, worker.id, start=now + hours(start), end=now + hours(end)
+    )
+    job_id = td.add_job(transactional_db, a.id)
+
+    result = td.match_ids(transactional_db, a.id, job_id, now=now)
+
+    assert result == ([worker.id] if matched else [])
