@@ -460,6 +460,14 @@ def test_worker_of_company_b_never_receives_company_a_events(
     job_id = add_job(transactional_db, a.id)
     with worker_socket(client, b.worker) as ws:
         assert start_offering(client, a.dispatcher, job_id).status_code == 200
+        # Dispatch can never pick b.worker as a candidate for a's job (wrong
+        # company, wrong trade) regardless of the registry, so also publish
+        # directly under a worker id that collides with b.worker's: the
+        # registry key is (company_id, user_id), and this proves company_id
+        # alone decides delivery even when user_id matches.
+        offer_notifier.get_offer_notifier().publish(
+            a.id, b.worker.id, OfferClosedEvent(type="offer.taken", offer_id=1, job_id=job_id)
+        )
         assert_quiet(ws)
 
 
