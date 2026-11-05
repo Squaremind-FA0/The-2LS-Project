@@ -7,10 +7,22 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import app.services.offer_notifier as offer_notifier
 from app.auth.deps import ws_principal
+from app.config import settings
 from app.schemas.jobs import OfferClosedEvent, OfferCreatedEvent
 from app.security.tokens import create_access_token
+from app.services import dispatch
 from app.services.offer_notifier import OVERFLOW, InProcessOfferNotifier
+from tests.factories import auth_header
+from tests.test_dispatch import (
+    add_job,
+    add_worker,
+    expire_offers_now,
+    offers_for,
+    start_offering,
+)
+from tests.test_dispatch import sweep as sweep_request
 
 # --- Phase 1: contract ---------------------------------------------------------------------
 
@@ -143,3 +155,162 @@ def test_disconnect_empties_the_registry_key():
         assert (1, 10) not in notifier._connections
 
     asyncio.run(run())
+
+
+# --- Phase 4: dispatch publishes after commit -------------------------------------------------
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def connect(self, company_id, user_id):
+        raise NotImplementedError
+
+    def disconnect(self, connection):
+        raise NotImplementedError
+
+    def publish(self, company_id, worker_id, event):
+        self.calls.append((company_id, worker_id, event))
+
+
+@pytest.fixture
+def pushed(monkeypatch):
+    recorder = _Recorder()
+    monkeypatch.setattr(offer_notifier, "_notifier", recorder)
+    return recorder.calls
+
+
+def test_offering_publishes_offer_created_with_distance(
+    client, two_companies, transactional_db, pushed
+):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    [(company_id, worker_id, event)] = pushed
+    assert company_id == a.id
+    assert worker_id == w.id
+    assert event.type == "offer.created"
+    assert event.job_id == job_id
+    assert event.distance_km == pytest.approx(1.0, abs=0.01)
+
+
+def test_cancel_publishes_offer_expired(client, two_companies, transactional_db, pushed):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    pushed.clear()
+    response = client.patch(
+        f"/api/jobs/{job_id}", json={"status": "cancelled"}, headers=auth_header(a.dispatcher)
+    )
+    assert response.status_code == 200
+    [(company_id, worker_id, event)] = pushed
+    assert company_id == a.id
+    assert worker_id == w.id
+    assert event.type == "offer.expired"
+    assert event.job_id == job_id
+
+
+def test_accept_publishes_offer_taken_to_losers_only(
+    client, two_companies, transactional_db, pushed
+):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offers = offers_for(transactional_db, a.id, job_id)
+    pushed.clear()
+    response = client.post(f"/api/offers/{offers[w1.id].id}/accept", headers=auth_header(w1))
+    assert response.status_code == 200
+    [(company_id, worker_id, event)] = pushed
+    assert company_id == a.id
+    assert worker_id == w2.id
+    assert event.type == "offer.taken"
+    assert event.job_id == job_id
+
+
+def test_decline_publishes_offer_created_for_the_top_up_only(
+    client, two_companies, transactional_db, pushed, monkeypatch
+):
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 1)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offer_id = offers_for(transactional_db, a.id, job_id)[w1.id].id
+    pushed.clear()
+    response = client.post(f"/api/offers/{offer_id}/decline", headers=auth_header(w1))
+    assert response.status_code == 200
+    [(company_id, worker_id, event)] = pushed
+    assert company_id == a.id
+    assert worker_id == w2.id
+    assert event.type == "offer.created"
+
+
+def test_sweep_publishes_expired_then_created_for_the_next_ring(
+    client, two_companies, transactional_db, pushed, monkeypatch
+):
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 1)
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    expire_offers_now(transactional_db, a.id, job_id)
+    pushed.clear()
+    response = sweep_request(client, a.admin)
+    assert response.status_code == 200
+    assert [event.type for _, _, event in pushed] == ["offer.expired", "offer.created"]
+    assert pushed[0][1] == w1.id
+    assert pushed[1][1] == w2.id
+
+
+def test_lost_accept_race_publishes_nothing(client, two_companies, transactional_db, pushed):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert client.post(
+        f"/api/offers/{offers[w1.id].id}/accept", headers=auth_header(w1)
+    ).status_code == 200
+    pushed.clear()
+    response = client.post(f"/api/offers/{offers[w2.id].id}/accept", headers=auth_header(w2))
+    assert response.status_code in (409, 410)
+    assert pushed == []
+
+
+def test_notifier_failure_does_not_fail_the_request(
+    client, two_companies, transactional_db, monkeypatch
+):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+
+    class _Boom:
+        def publish(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(offer_notifier, "_notifier", _Boom())
+    response = start_offering(client, a.dispatcher, job_id)
+    assert response.status_code == 200
+    assert offers_for(transactional_db, a.id, job_id)
+
+
+def test_no_publish_when_commit_fails(client, two_companies, transactional_db, monkeypatch):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    calls = []
+    monkeypatch.setattr(dispatch, "_publish", lambda *x: calls.append(x))
+    from sqlalchemy.orm import Session
+
+    monkeypatch.setattr(Session, "commit", lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        start_offering(client, a.dispatcher, job_id)
+    assert calls == []
