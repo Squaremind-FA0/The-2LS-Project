@@ -130,6 +130,7 @@ def test_audit_actually_sees_the_api_routes():
         "/api/offers/{offer_id}/accept",
         "/api/offers/{offer_id}/decline",
         "/api/dispatch/sweep",
+        "/api/ws/worker",
     } <= guarded
 
 
@@ -159,6 +160,18 @@ def test_dispatch_routes_require_the_prp_roles():
         if (method, route.path) in expected
     }
     assert actual == expected
+
+
+def test_ws_worker_route_requires_the_worker_role():
+    # WS routes have no HTTP methods, so test_dispatch_routes_require_the_prp_roles
+    # (keyed on method + path) cannot cover this one.
+    [route] = [r for r in api_routes(app) if r.path == "/api/ws/worker"]
+    roles = {
+        role.value
+        for dep in _walk(route.dependant)
+        for role in getattr(dep.call, REQUIRE_WS_ROLE_MARKER, ())
+    }
+    assert roles == {"worker"}
 
 
 # --- self-checks: the audit must be able to fail ------------------------------------------

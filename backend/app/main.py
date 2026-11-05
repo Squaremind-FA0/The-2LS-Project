@@ -1,17 +1,23 @@
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.routers import auth, dispatch, jobs, me, workers
+from app.routers import auth, dispatch, jobs, me, workers, ws
 
 app = FastAPI(title="API")
 app.add_middleware(
     CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"],
 )
+
+
+@app.exception_handler(WebSocketDisconnect)
+async def _client_left(websocket: WebSocket, exc: WebSocketDisconnect) -> None:
+    """A client leaving is not a server error: without this, leaving during
+    auth (or closing a socket that has just gone) logs an ASGI traceback."""
 
 
 @app.get("/api/health")
@@ -21,13 +27,14 @@ def health() -> dict:
 
 # API routers — keep every include_router call in this one block, above the
 # SPA catch-all below so /api/* matches first. Every /api/* route outside
-# app.auth.deps.PUBLIC_API_PATHS must depend on require_role(...) and use
-# get_tenant_db; tests/test_route_audit.py enforces that.
+# app.auth.deps.PUBLIC_API_PATHS must depend on require_role(...)/require_ws_role(...)
+# and use get_tenant_db; tests/test_route_audit.py enforces that.
 app.include_router(auth.router)
 app.include_router(me.router)
 app.include_router(workers.router)
 app.include_router(jobs.router)
 app.include_router(dispatch.router)
+app.include_router(ws.router)
 
 
 # Single-origin production: when the built frontend exists (docker image or

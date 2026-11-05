@@ -3,26 +3,39 @@ commit-then-notify, polling fallback and the socket itself.
 """
 
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import WebSocketDisconnect
+from fastapi.routing import APIWebSocketRoute
+from fastapi.testclient import TestClient
 
 import app.services.offer_notifier as offer_notifier
 from app.auth.deps import ws_principal
 from app.config import settings
+from app.db import SQLITE_BUSY_TIMEOUT_S
+from app.main import app as fastapi_app
+from app.models import User
 from app.schemas.jobs import OfferClosedEvent, OfferCreatedEvent
 from app.security.tokens import create_access_token
 from app.services import dispatch
 from app.services.offer_notifier import OVERFLOW, InProcessOfferNotifier
-from tests.factories import auth_header
+from tests.factories import auth_header, tenant_context
 from tests.test_dispatch import (
     add_job,
     add_worker,
+    db_file_based,  # noqa: F401
     expire_offers_now,
+    file_company,  # noqa: F401
+    job_body,
     offers_for,
     start_offering,
 )
 from tests.test_dispatch import sweep as sweep_request
+from tests.test_route_audit import api_routes
 
 # --- Phase 1: contract ---------------------------------------------------------------------
 
@@ -383,3 +396,248 @@ def test_get_pending_requires_the_worker_role(client, two_companies):
     a, _ = two_companies
     assert client.get("/api/offers/pending", headers=auth_header(a.dispatcher)).status_code == 403
     assert client.get("/api/offers/pending", headers=auth_header(a.admin)).status_code == 403
+
+
+# --- Phase 6: the socket -----------------------------------------------------------------------
+
+
+def recv(ws, timeout=2.0):
+    with ThreadPoolExecutor(1) as pool:
+        return pool.submit(ws.receive_json).result(timeout=timeout)
+
+
+def token_for(user):
+    return create_access_token(user.id, user.token_version)
+
+
+@contextmanager
+def worker_socket(client, user):
+    with client.websocket_connect("/api/ws/worker") as ws:
+        ws.send_json({"type": "auth", "token": token_for(user)})
+        assert recv(ws) == {"type": "auth.ok"}
+        yield ws
+
+
+def assert_quiet(ws):
+    ws.send_json({"type": "ping"})
+    assert recv(ws) == {"type": "pong"}
+
+
+def closed_with(ws):
+    """Drain any ping/event frames first: the socket may legitimately send
+    something before it closes."""
+    with pytest.raises(WebSocketDisconnect) as exc:
+        while True:
+            recv(ws)
+    return exc.value.code
+
+
+def test_authenticated_worker_receives_offer_created_within_2s(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    with worker_socket(client, w) as ws:
+        assert start_offering(client, a.dispatcher, job_id).status_code == 200
+        event = recv(ws)
+    assert event["type"] == "offer.created"
+    assert event["job_id"] == job_id
+    assert event["distance_km"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_unauthenticated_ws_connection_is_rejected(client, monkeypatch):
+    monkeypatch.setattr(settings, "WS_AUTH_TIMEOUT_S", 0.1)
+    with client.websocket_connect("/api/ws/worker") as ws:
+        assert closed_with(ws) == 4401  # silence past the deadline
+
+
+def test_worker_of_company_b_never_receives_company_a_events(
+    client, two_companies, transactional_db
+):
+    a, b = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    with worker_socket(client, b.worker) as ws:
+        assert start_offering(client, a.dispatcher, job_id).status_code == 200
+        assert_quiet(ws)
+
+
+def test_reconnect_then_get_pending_returns_missed_offers(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    with worker_socket(client, w):
+        pass
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    with worker_socket(client, w) as ws:
+        assert_quiet(ws)
+        r = client.get("/api/offers/pending", headers=auth_header(w))
+    assert r.status_code == 200
+    [row] = r.json()
+    offer = offers_for(transactional_db, a.id, job_id)[w.id]
+    assert row["offer_id"] == offer.id and row["job"]["id"] == job_id
+    assert row["distance_km"] == pytest.approx(1.0, abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "send",
+    [
+        lambda ws: ws.send_text("not json"),
+        lambda ws: ws.send_bytes(b"\x00\x01"),
+        lambda ws: ws.send_json([1, 2, 3]),
+        lambda ws: ws.send_json({"type": "wrong"}),
+        lambda ws: ws.send_json({"type": "auth"}),
+        lambda ws: ws.send_json({"type": "auth", "token": 12345}),
+        lambda ws: ws.send_json({"type": "auth", "token": "not-a-real-jwt"}),
+    ],
+    ids=[
+        "not-json",
+        "binary",
+        "not-an-object",
+        "wrong-type",
+        "no-token",
+        "non-string-token",
+        "bad-jwt",
+    ],
+)
+def test_malformed_first_frame_is_rejected(client, send):
+    with client.websocket_connect("/api/ws/worker") as ws:
+        send(ws)
+        assert closed_with(ws) == 4401
+
+
+def test_non_worker_rejected_4403(client, two_companies):
+    a, _ = two_companies
+    with client.websocket_connect("/api/ws/worker") as ws:
+        ws.send_json({"type": "auth", "token": token_for(a.dispatcher)})
+        assert closed_with(ws) == 4403
+
+
+def test_stale_token_version_rejected(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    token = token_for(w)
+    with tenant_context(transactional_db, a.id):
+        user = transactional_db.get(User, w.id)
+        user.bump_token_version()
+        transactional_db.flush()
+    with client.websocket_connect("/api/ws/worker") as ws:
+        ws.send_json({"type": "auth", "token": token})
+        assert closed_with(ws) == 4401
+
+
+def test_taken_and_expired_routes(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offers = offers_for(transactional_db, a.id, job_id)
+    with worker_socket(client, w2) as ws:
+        assert client.post(
+            f"/api/offers/{offers[w1.id].id}/accept", headers=auth_header(w1)
+        ).status_code == 200
+        event = recv(ws)
+    assert event == {"type": "offer.taken", "offer_id": offers[w2.id].id, "job_id": job_id}
+
+    job2_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job2_id).status_code == 200
+    offer2 = offers_for(transactional_db, a.id, job2_id)[w2.id]
+    with worker_socket(client, w2) as ws:
+        response = client.patch(
+            f"/api/jobs/{job2_id}",
+            json={"status": "cancelled"},
+            headers=auth_header(a.dispatcher),
+        )
+        assert response.status_code == 200
+        event2 = recv(ws)
+    assert event2 == {"type": "offer.expired", "offer_id": offer2.id, "job_id": job2_id}
+
+
+def test_sweep_pushes_expired(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offer = offers_for(transactional_db, a.id, job_id)[w.id]
+    expire_offers_now(transactional_db, a.id, job_id)
+    with worker_socket(client, w) as ws:
+        assert sweep_request(client, a.admin).status_code == 200
+        event = recv(ws)
+    assert event == {"type": "offer.expired", "offer_id": offer.id, "job_id": job_id}
+
+
+def test_heartbeat_ping_and_revalidation_close(
+    client, two_companies, transactional_db, monkeypatch
+):
+    monkeypatch.setattr(settings, "WS_HEARTBEAT_S", 0.2)
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    with client.websocket_connect("/api/ws/worker") as ws:
+        ws.send_json({"type": "auth", "token": token_for(w)})
+        assert recv(ws) == {"type": "auth.ok"}
+        assert recv(ws) == {"type": "ping"}
+        with tenant_context(transactional_db, a.id):
+            user = transactional_db.get(User, w.id)
+            user.bump_token_version()
+            transactional_db.flush()
+        ws.send_json({"type": "pong"})
+        assert closed_with(ws) == 4401
+
+
+def test_heartbeat_timeout_closes_4408(client, two_companies, transactional_db, monkeypatch):
+    monkeypatch.setattr(settings, "WS_HEARTBEAT_S", 0.1)
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    with client.websocket_connect("/api/ws/worker") as ws:
+        ws.send_json({"type": "auth", "token": token_for(w)})
+        assert recv(ws) == {"type": "auth.ok"}
+        assert closed_with(ws) == 4408
+
+
+def test_overflow_closes_1013(client, two_companies, transactional_db, monkeypatch):
+    monkeypatch.setattr(settings, "WS_QUEUE_MAX", 2)
+    monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 1)
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_ids = [add_job(transactional_db, a.id) for _ in range(5)]
+    for job_id in job_ids:
+        assert start_offering(client, a.dispatcher, job_id).status_code == 200
+        expire_offers_now(transactional_db, a.id, job_id)
+    with worker_socket(client, w) as ws:
+        assert sweep_request(client, a.admin).status_code == 200
+        assert closed_with(ws) == 1013
+
+
+def test_registry_empty_after_disconnect(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    with worker_socket(client, w):
+        pass
+    notifier = offer_notifier.get_offer_notifier()
+    assert not notifier._connections.get((a.id, w.id))
+
+
+def test_every_api_websocket_route_rejects_unauthenticated(client, monkeypatch):
+    monkeypatch.setattr(settings, "WS_AUTH_TIMEOUT_S", 0.1)
+    ws_routes = [r for r in api_routes(fastapi_app) if isinstance(r.original, APIWebSocketRoute)]
+    assert ws_routes
+    for route in ws_routes:
+        with client.websocket_connect(route.path) as ws:
+            assert closed_with(ws) == 4401
+
+
+def test_open_socket_does_not_hold_the_sqlite_write_lock(db_file_based, file_company):  # noqa: F811
+    """Real file database, real commits: every transaction is BEGIN IMMEDIATE,
+    so a socket that kept its session open would block this write for the
+    full busy timeout and then fail."""
+    test_client = TestClient(fastapi_app)
+    with worker_socket(test_client, file_company.worker):
+        started = time.monotonic()
+        response = test_client.post(
+            "/api/jobs", json=job_body(), headers=auth_header(file_company.dispatcher)
+        )
+        elapsed = time.monotonic() - started
+    assert response.status_code == 201
+    assert elapsed < SQLITE_BUSY_TIMEOUT_S / 2
