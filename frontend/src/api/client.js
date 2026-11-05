@@ -65,6 +65,15 @@ export async function apiRequest(path, { json, ...options } = {}) {
   return body;
 }
 
+async function apiBlob(path) {
+  const response = await apiFetch(path);
+  if (!response.ok) {
+    const detail = await response.json().then((body) => body?.detail, () => undefined);
+    throw new ApiError(response.status, describeDetail(detail, response.status));
+  }
+  return response.blob();
+}
+
 function withQuery(path, params = {}) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -124,4 +133,5 @@ export const payruns = {
     apiRequest(`/payruns/${id(payrunId)}`, { method: 'PATCH', json: { status } }),
   paylines: (payrunId) => apiRequest(`/payruns/${id(payrunId)}/paylines`),
   exportUrl: (payrunId) => `/api/payruns/${id(payrunId)}/export?format=csv`,
+  exportCsv: (payrunId) => apiBlob(`/payruns/${id(payrunId)}/export?format=csv`),
 };
