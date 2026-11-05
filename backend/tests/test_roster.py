@@ -3,11 +3,13 @@
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.models import Job, JobOffer, JobStatus, Shift, TimeEntry
 from app.models.job import utcnow
+from app.services import dispatch
+from app.services import time_entries as entries_service
 from tests import test_dispatch as td
 from tests.factories import auth_header, tenant_context
 
@@ -424,6 +426,62 @@ def test_db_rejects_a_second_time_entry_for_a_job(transactional_db, two_companie
         with pytest.raises(IntegrityError):
             transactional_db.flush()
         transactional_db.rollback()
+
+
+# SQLite serialises whole requests, so a real race never reaches the race guards
+# below. Stale objects in the session reproduce what a concurrent writer does
+# on Postgres, deterministically.
+
+
+def test_clock_in_refuses_a_job_cancelled_after_it_was_read(transactional_db, two_companies):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    with tenant_context(transactional_db, a.id):
+        stale = transactional_db.get(Job, job_id)
+        assert stale.status is JobStatus.assigned
+        transactional_db.execute(
+            update(Job)
+            .where(Job.id == job_id)
+            .values(status=JobStatus.cancelled)
+            .execution_options(synchronize_session=False)
+        )
+        with pytest.raises(dispatch.Conflict, match="changed concurrently"):
+            entries_service.clock_in(transactional_db, job_id, a.worker.id)
+    assert time_entries(transactional_db, a.id, job_id) == []
+
+
+def test_clock_in_falls_back_on_the_unique_constraint(
+    transactional_db, two_companies, monkeypatch
+):
+    a, _ = two_companies
+    job_id = on_shift_worker_job(transactional_db, a)
+    with tenant_context(transactional_db, a.id):
+        transactional_db.add(TimeEntry(job_id=job_id, worker_id=a.worker.id, started_at=utcnow()))
+        transactional_db.commit()
+        monkeypatch.setattr(entries_service, "_entry_for", lambda db, job_id: None)
+        with pytest.raises(dispatch.Conflict, match="already has a TimeEntry"):
+            entries_service.clock_in(transactional_db, job_id, a.worker.id)
+    assert len(time_entries(transactional_db, a.id, job_id)) == 1
+    assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.assigned
+
+
+def test_clock_out_refuses_an_entry_closed_after_it_was_read(transactional_db, two_companies):
+    a, _ = two_companies
+    job_id = assigned_job(transactional_db, a.id, a.worker.id, JobStatus.in_progress)
+    closed_at = utcnow() - hours(1)
+    with tenant_context(transactional_db, a.id):
+        stale = TimeEntry(job_id=job_id, worker_id=a.worker.id, started_at=closed_at - hours(1))
+        transactional_db.add(stale)
+        transactional_db.flush()
+        assert stale.ended_at is None
+        transactional_db.execute(
+            update(TimeEntry)
+            .where(TimeEntry.id == stale.id)
+            .values(ended_at=closed_at)
+            .execution_options(synchronize_session=False)
+        )
+        with pytest.raises(dispatch.Conflict, match="already ended"):
+            entries_service.clock_out(transactional_db, job_id, a.worker.id)
 
 
 def test_concurrent_clock_in_only_one_wins(db_file_based, file_company):
