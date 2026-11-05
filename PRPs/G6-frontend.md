@@ -55,10 +55,10 @@ This PRP was dispatched with `main` at `fb5de96` (G1+G2+G3 only), with `prp/G4` 
 
 ### Dispatch / offers / location (`main`, G3+G4)
 
-- `PUT /api/workers/me/location` (`backend/app/routers/dispatch.py:34-41`, `worker`) — `{lat, lng}` → `200 WorkerLocationOut`.
-- `GET /api/offers/pending` (`dispatch.py:44-51`, `worker`) — `?limit=` (1–200) → `200 list[PendingOfferOut]`, soonest-expiring first. Call this after every WS (re)connect's `auth.ok` — see WS protocol below.
-- `POST /api/offers/{id}/accept` (`dispatch.py:54-62`, `worker`) → `200 JobOfferOut`; `409 {detail: "Job already assigned"}` (`backend/app/services/dispatch.py:454`) when someone else already won it; `410 {detail: "Offer expired"}` (`Gone.detail`, `backend/app/services/dispatch.py:217-218`, raised as the default when no other message is given) when it timed out.
-- `POST /api/offers/{id}/decline` (`dispatch.py:65-73`, `worker`) → `200 JobOfferOut`.
+- `PUT /api/workers/me/location` (`backend/app/routers/dispatch.py:36-43`, `worker`) — `{lat, lng}` → `200 WorkerLocationOut`.
+- `GET /api/offers/pending` (`dispatch.py:46-53`, `worker`) — `?limit=` (1–200) → `200 list[PendingOfferOut]`, soonest-expiring first. Call this after every WS (re)connect's `auth.ok` — see WS protocol below.
+- `POST /api/offers/{id}/accept` (`dispatch.py:56-64`, `worker`) → `200 JobOfferOut`; `409 {detail: "Job already assigned"}` (`backend/app/services/dispatch.py:454`) when someone else already won it; `410 {detail: "Offer expired"}` (`Gone.detail`, `backend/app/services/dispatch.py:217-218`, raised as the default when no other message is given) when it timed out.
+- `POST /api/offers/{id}/decline` (`dispatch.py:67-75`, `worker`) → `200 JobOfferOut`.
 - `PendingOfferOut` / `JobOfferOut` shape (`backend/app/schemas/jobs.py:61-69,94-115`):
   ```
   JobOfferOut:   { id, job_id, worker_id, status, expires_at, created_at }
@@ -144,7 +144,7 @@ PayLineResponse:  { id, payrun_id, worker_id, minutes_worked, hourly_rate_cents,
   /admin/jobs             AdminJobsPage         (create/transition: dispatcher; view: both)
   /admin/roster           AdminRosterPage       (gap placeholder, both roles — see Known backend gap #3)
   /admin/payruns          AdminPayRunsPage      (company_admin only)
-*                         NotFound
+*                         redirect -> /
 ```
 
 ## Component tree
@@ -233,8 +233,8 @@ Ordered bottom-up so `npm run build` and `npm test` (the Validation gates) stay 
 
 ### Phase 7 — app shell
 
-30. `frontend/src/App.test.jsx` — rewrite the placeholder assertions (`frontend/src/App.test.jsx:7-10`): unauthenticated `/` renders the real `Login` form (email + password fields), not placeholder text; an authenticated `worker` hitting `/admin` is redirected away, and vice versa.
-31. `frontend/src/App.jsx` — replace the placeholder `Login`/`Worker`/`Admin` functions (`frontend/src/App.jsx:3-13`) with the route **shell**: `/login` → `Login`, `/` → role-based redirect, `/worker/*` → `RoleGuard allow=[worker]` wrapping `WorkerLayout` with an index redirect to `/worker/jobs`, `/admin/*` → `RoleGuard allow=[company_admin, dispatcher]` wrapping `AdminLayout` with an index redirect to `/admin/jobs`, `*` → `NotFound`. No leaf page `<Route>` yet under `/worker/*`/`/admin/*` — those are added one at a time, below, by the task that implements each page.
+30. `frontend/src/App.test.jsx` — rewrite the placeholder assertions (`frontend/src/App.test.jsx:7-10`): unauthenticated `/` renders the real `Login` form (email + password fields), not placeholder text; an authenticated `worker` hitting `/admin` is redirected away, and vice versa; an unknown path redirects through `/` (unauthenticated: lands on the `Login` form).
+31. `frontend/src/App.jsx` — replace the placeholder `Login`/`Worker`/`Admin` functions (`frontend/src/App.jsx:3-13`) with the route **shell**: `/login` → `Login`, `/` → role-based redirect, `/worker/*` → `RoleGuard allow=[worker]` wrapping `WorkerLayout` with an index redirect to `/worker/jobs`, `/admin/*` → `RoleGuard allow=[company_admin, dispatcher]` wrapping `AdminLayout` with an index redirect to `/admin/jobs`, `*` → `<Navigate to="/" replace />` (inline fallback, no separate component). No leaf page `<Route>` yet under `/worker/*`/`/admin/*` — those are added one at a time, below, by the task that implements each page.
 
 ### Phase 8 — worker self-service pages
 
