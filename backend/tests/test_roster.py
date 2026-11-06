@@ -272,7 +272,10 @@ def on_shift_worker_job(db, company, status=JobStatus.assigned) -> int:
 
 
 def clock(client, action, job_id, user):
-    endpoint = "/api/me/jobs/{}/start".format(job_id) if action == "in" else "/api/me/jobs/{}/complete".format(job_id)
+    if action == "in":
+        endpoint = f"/api/me/jobs/{job_id}/start"
+    else:
+        endpoint = f"/api/me/jobs/{job_id}/complete"
     return client.post(endpoint, headers=auth_header(user))
 
 

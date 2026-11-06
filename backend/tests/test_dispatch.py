@@ -352,7 +352,9 @@ def test_dispatch_ring_size_defaults_to_three(client, two_companies, transaction
         (JobStatus.unfilled, "dispatching", 400),  # illegal transition
     ],
 )
-def test_invalid_transitions_are_400(client, two_companies, transactional_db, start, target, expected_status):
+def test_invalid_transitions_are_400(
+    client, two_companies, transactional_db, start, target, expected_status
+):
     a, _ = two_companies
     job_id = add_job(transactional_db, a.id, status=start)
     response = client.patch(f"/api/jobs/{job_id}", json={"version": 1, "status": target},
@@ -1306,4 +1308,5 @@ def test_re_offer_job_race_guards_offer_round_increment(transactional_db, two_co
         transactional_db.refresh(job)
         # The job should stay at round 2 (set by the simulated concurrent sweep),
         # not get incremented to 2 again (which would lose the change).
-        assert job.offer_round == 2, f"Expected offer_round=2 after losing race, got {job.offer_round}"
+        msg = f"Expected offer_round=2 after losing race, got {job.offer_round}"
+        assert job.offer_round == 2, msg

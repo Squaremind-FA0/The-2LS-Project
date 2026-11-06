@@ -739,8 +739,15 @@ def re_offer_job(
     # Guard on the current offer_round so concurrent sweeps race fairly: only one
     # can increment from its read value. If this loses the race (StaleJob), another
     # sweep already re-offered this job; let it close or re-offer again later.
+    current_round = job.offer_round
     try:
-        transition(job, JobStatus.dispatching, None, guards=(Job.offer_round == job.offer_round,), offer_round=job.offer_round + 1)
+        transition(
+            job,
+            JobStatus.dispatching,
+            None,
+            guards=(Job.offer_round == current_round,),
+            offer_round=current_round + 1,
+        )
     except StaleJob:
         db.rollback()
         return False
