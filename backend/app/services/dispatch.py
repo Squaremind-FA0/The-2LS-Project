@@ -725,6 +725,9 @@ def re_offer_job(
 
     Bounded: once ``offer_round`` reaches ``max_rounds``, or nobody new is in
     range, the job becomes ``unfilled`` (terminal) and False is returned.
+
+    Concurrent re-offers are guarded by a conditional UPDATE on offer_round so
+    only one sweep can win the race to offer the next ring.
     """
     if job.status is not JobStatus.dispatching or pending_offer_count(db, job.id):
         return False
@@ -733,8 +736,14 @@ def re_offer_job(
     if job.offer_round >= max_rounds or not create_offers(db, job, ring_size, now=now):
         _mark_unfilled(db, job)
         return False
-    job.offer_round += 1
-    db.flush()
+    # Guard on the current offer_round so concurrent sweeps race fairly: only one
+    # can increment from its read value. If this loses the race (StaleJob), another
+    # sweep already re-offered this job; let it close or re-offer again later.
+    try:
+        transition(job, JobStatus.dispatching, None, guards=(Job.offer_round == job.offer_round,), offer_round=job.offer_round + 1)
+    except StaleJob:
+        db.rollback()
+        return False
     return True
 
 

@@ -34,6 +34,7 @@ LEGAL = {
     (S.dispatching, S.cancelled),
     (S.assigned, S.cancelled),
     (S.in_progress, S.cancelled),
+    (S.dispatching, S.dispatching),
 }
 ALL_PAIRS = list(itertools.product(JobStatus, JobStatus))
 ILLEGAL = [pair for pair in ALL_PAIRS if pair not in LEGAL]

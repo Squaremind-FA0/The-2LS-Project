@@ -338,27 +338,26 @@ def test_dispatch_ring_size_defaults_to_three(client, two_companies, transaction
 
 
 @pytest.mark.parametrize(
-    ("start", "target"),
+    ("start", "target", "expected_status"),
     [
-        (JobStatus.draft, "draft"),
-        (JobStatus.dispatching, "dispatching"),
-        (JobStatus.dispatching, "draft"),
-        (JobStatus.cancelled, "dispatching"),
-        (JobStatus.assigned, "dispatching"),
-        (JobStatus.assigned, "completed"),
-        (JobStatus.in_progress, "dispatching"),
-        (JobStatus.completed, "in_progress"),
-        (JobStatus.completed, "cancelled"),
-        (JobStatus.cancelled, "in_progress"),
-        (JobStatus.unfilled, "dispatching"),
+        (JobStatus.draft, "draft", 422),  # draft not in Literal schema
+        (JobStatus.dispatching, "draft", 422),  # draft not in Literal schema
+        (JobStatus.cancelled, "dispatching", 400),  # illegal transition
+        (JobStatus.assigned, "dispatching", 400),  # illegal transition
+        (JobStatus.assigned, "completed", 400),  # illegal transition
+        (JobStatus.in_progress, "dispatching", 400),  # illegal transition
+        (JobStatus.completed, "in_progress", 400),  # illegal transition
+        (JobStatus.completed, "cancelled", 400),  # illegal transition
+        (JobStatus.cancelled, "in_progress", 400),  # illegal transition
+        (JobStatus.unfilled, "dispatching", 400),  # illegal transition
     ],
 )
-def test_invalid_transitions_are_400(client, two_companies, transactional_db, start, target):
+def test_invalid_transitions_are_400(client, two_companies, transactional_db, start, target, expected_status):
     a, _ = two_companies
     job_id = add_job(transactional_db, a.id, status=start)
     response = client.patch(f"/api/jobs/{job_id}", json={"version": 1, "status": target},
                             headers=auth_header(a.dispatcher))
-    assert response.status_code == 400
+    assert response.status_code == expected_status
     assert fresh(transactional_db, a.id, Job, job_id).status is start
 
 
@@ -1250,3 +1249,61 @@ def test_get_me_offers_alias_matches_offers_pending(client, two_companies, trans
 
     assert via_pending.status_code == via_alias.status_code == 200
     assert via_pending.json() == via_alias.json()
+
+def test_re_offer_job_race_guards_offer_round_increment(transactional_db, two_companies):
+    """Regression: concurrent re_offer_job calls should not both increment offer_round
+    when one should win the race. This test simulates the race by manually updating
+    offer_round between the read and the increment to verify the guard works."""
+    from sqlalchemy import update
+    
+    a, _ = two_companies
+    with tenant_context(transactional_db, a.id):
+        # Create a dispatching job with workers in range for 3 rounds
+        w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+        w2 = add_worker(transactional_db, a.id, "w2", 1.0)
+        w3 = add_worker(transactional_db, a.id, "w3", 1.0)
+        w4 = add_worker(transactional_db, a.id, "w4", 1.0)
+        
+        job = Job(
+            title="Multi-round job", trade="plumbing", address="1 George St",
+            lat=JOB_LAT, lng=JOB_LNG, status=JobStatus.dispatching,
+            company_id=a.id, offer_round=1
+        )
+        transactional_db.add(job)
+        transactional_db.flush()
+        
+        # Create initial offers (round 1)
+        now = utcnow()
+        for worker in [w1, w2, w3, w4]:
+            offer = JobOffer(
+                job_id=job.id, worker_id=worker.id, status=OfferStatus.pending,
+                expires_at=now + timedelta(minutes=5)
+            )
+            transactional_db.add(offer)
+        transactional_db.flush()
+        
+        # Expire all pending offers to simulate them being declined
+        transactional_db.execute(
+            update(JobOffer)
+            .where(JobOffer.job_id == job.id)
+            .values(status=OfferStatus.expired)
+            .execution_options(synchronize_session=False)
+        )
+        
+        # Simulate a concurrent sweep by manually incrementing offer_round
+        # This represents sweep A incrementing from 1 to 2
+        transactional_db.execute(
+            update(Job).where(Job.id == job.id).values(offer_round=2)
+            .execution_options(synchronize_session=False)
+        )
+        
+        # Now try re_offer_job with the stale job object (offer_round=1 in memory)
+        # If there's no guard, this would increment to 2, but the DB is already at 2.
+        # With the proper guard, this should detect the race and return False.
+        result = dispatch.re_offer_job(transactional_db, job, now=now)
+        assert result is False, "re_offer_job should lose the race when offer_round changed"
+
+        transactional_db.refresh(job)
+        # The job should stay at round 2 (set by the simulated concurrent sweep),
+        # not get incremented to 2 again (which would lose the change).
+        assert job.offer_round == 2, f"Expected offer_round=2 after losing race, got {job.offer_round}"

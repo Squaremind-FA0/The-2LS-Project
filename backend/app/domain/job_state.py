@@ -21,7 +21,7 @@ S = JobStatus
 
 TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     S.draft: frozenset({S.dispatching, S.cancelled}),
-    S.dispatching: frozenset({S.assigned, S.unfilled, S.cancelled}),
+    S.dispatching: frozenset({S.assigned, S.unfilled, S.cancelled, S.dispatching}),
     S.assigned: frozenset({S.in_progress, S.cancelled}),
     S.in_progress: frozenset({S.completed, S.cancelled}),
     S.completed: frozenset(),
