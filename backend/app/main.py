@@ -1,14 +1,52 @@
+import asyncio
+import contextlib
+import logging
 import os
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.routers import auth, dispatch, jobs, me, payruns, shifts, time_entries, workers, ws
+from app.services import dispatch as dispatch_service
 
-app = FastAPI(title="API")
+logger = logging.getLogger(__name__)
+
+
+async def _dispatch_sweep_loop() -> None:
+    """Bounded background sweep: expire stale offers and re-offer, per
+    company, every DISPATCH_SWEEP_INTERVAL_S. Sleeps first, so a short-lived
+    app (e.g. a test's `with TestClient(app):` block) never runs one. Not a
+    substitute for correctness: GET /api/offers/pending and the accept/
+    decline guards already treat a past-expires_at offer as inert on their
+    own, so a missed or delayed tick, or a restart, is never unsafe -- this
+    loop only makes expiry and re-offering happen without a poller calling
+    POST /api/dispatch/sweep.
+    """
+    while True:
+        await asyncio.sleep(settings.DISPATCH_SWEEP_INTERVAL_S)
+        try:
+            await run_in_threadpool(dispatch_service.sweep_all_companies)
+        except Exception:
+            logger.exception("dispatch sweep loop: iteration failed")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    task = asyncio.create_task(_dispatch_sweep_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=settings.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"],
 )

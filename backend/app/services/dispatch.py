@@ -19,8 +19,7 @@ Race safety comes from the database, not from read-then-check code:
 from __future__ import annotations
 
 import logging
-import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -29,6 +28,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.db import SessionLocal
+from app.dispatch.matcher import bounding_box, has_trade, haversine_km, rank_candidates
 from app.domain.job_state import (
     TERMINAL,
     IllegalTransition,
@@ -37,6 +38,7 @@ from app.domain.job_state import (
     update_details,
 )
 from app.models import (
+    Company,
     Job,
     JobOffer,
     JobStatus,
@@ -48,9 +50,12 @@ from app.models import (
     WorkerProfile,
 )
 from app.models.job import utcnow
+from app.realtime.hub import get_hub
 from app.schemas.jobs import (
     JobCreateRequest,
     JobOfferOut,
+    JobOut,
+    JobUpdatedEvent,
     OfferClosedEvent,
     OfferCreatedEvent,
     OfferEvent,
@@ -58,77 +63,9 @@ from app.schemas.jobs import (
     PendingOfferOut,
 )
 from app.services.offer_notifier import get_offer_notifier
+from app.tenancy import TENANT_INFO_KEY
 
 logger = logging.getLogger(__name__)
-
-EARTH_RADIUS_KM = 6371.0088  # IUGG mean Earth radius
-
-
-# --- pure geometry ------------------------------------------------------------------------
-
-
-def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Great-circle distance in kilometres."""
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    d_phi = phi2 - phi1
-    d_lambda = math.radians(lng2 - lng1)
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    return 2 * EARTH_RADIUS_KM * math.asin(min(1.0, math.sqrt(a)))
-
-
-@dataclass(frozen=True)
-class BoundingBox:
-    min_lat: float
-    max_lat: float
-    # None when the box would wrap the antimeridian or cover a pole: the
-    # longitude prefilter is skipped and haversine alone decides.
-    min_lng: float | None
-    max_lng: float | None
-
-
-def bounding_box(lat: float, lng: float, radius_km: float) -> BoundingBox:
-    """A lat/lng box that fully contains the circle of ``radius_km``.
-
-    Coarse on purpose: it only drives an indexed prefilter; haversine makes
-    the exact cut. A small margin absorbs floating-point error at the edge.
-    """
-    d_lat = math.degrees(radius_km / EARTH_RADIUS_KM) * 1.01
-    min_lat, max_lat = max(-90.0, lat - d_lat), min(90.0, lat + d_lat)
-    widest = max(abs(min_lat), abs(max_lat))
-    if widest >= 89.9:
-        return BoundingBox(min_lat, max_lat, None, None)
-    d_lng = d_lat / math.cos(math.radians(widest))
-    min_lng, max_lng = lng - d_lng, lng + d_lng
-    if min_lng < -180.0 or max_lng > 180.0:
-        return BoundingBox(min_lat, max_lat, None, None)
-    return BoundingBox(min_lat, max_lat, min_lng, max_lng)
-
-
-def has_trade(trades: Iterable[str], trade: str) -> bool:
-    wanted = trade.strip().casefold()
-    return any(t.strip().casefold() == wanted for t in trades or ())
-
-
-@dataclass(frozen=True)
-class Candidate:
-    user: User
-    distance_km: float
-
-
-def rank_candidates(
-    lat: float,
-    lng: float,
-    rows: Iterable[tuple[User, float, float]],
-    max_distance_km: float,
-) -> list[Candidate]:
-    """Exact radius cut + nearest-first sort (ties broken by user id)."""
-    ranked = []
-    for user, w_lat, w_lng in rows:
-        distance = haversine_km(lat, lng, w_lat, w_lng)
-        if distance <= max_distance_km:
-            ranked.append(Candidate(user, distance))
-    ranked.sort(key=lambda c: (c.distance_km, c.user.id))
-    return ranked
 
 
 # --- matching -----------------------------------------------------------------------------
@@ -295,6 +232,24 @@ def _publish(company_id: int, events: Iterable[tuple[int, OfferEvent]]) -> None:
             logger.exception("offer push failed for worker %s", worker_id)
 
 
+def _job_updated_event(job: Job) -> JobUpdatedEvent:
+    """Build before db.commit(): a read of ``job`` after commit would hit
+    SQLAlchemy's commit-time expiry and open a new BEGIN IMMEDIATE
+    transaction -- the same commit-then-notify rule every other event in
+    this module follows (see _created_events/_closed_events/_publish)."""
+    return JobUpdatedEvent(job=JobOut.model_validate(job))
+
+
+def _publish_job_updated(company_id: int, event: JobUpdatedEvent) -> None:
+    """Call only after db.commit() succeeded, with ``event`` already built
+    by _job_updated_event beforehand. Same failure handling as _publish: a
+    push failure is logged, never fails the request."""
+    try:
+        get_hub().publish(f"company:{company_id}", event)
+    except Exception:
+        logger.exception("job.updated push failed for company %s", company_id)
+
+
 def list_pending_offers(
     db: Session, worker_id: int, *, limit: int = 200, now: datetime | None = None
 ) -> list[PendingOfferOut]:
@@ -449,8 +404,10 @@ def transition_job(
         events = _created_events(db, job, create_offers(db, job, now=now))
     elif target is JobStatus.cancelled:
         events = _closed_events("offer.expired", _expire_pending(db, job_id))
+    job_updated = _job_updated_event(job)
     db.commit()
     _publish(company_id, events)
+    _publish_job_updated(company_id, job_updated)
     db.refresh(job)
     return job
 
@@ -487,15 +444,19 @@ def pending_offer_count(db: Session, job_id: int) -> int:
     )
 
 
-def _expire_returning(db: Session, stmt) -> list[ClosedOffer]:
-    """Flip ``stmt``'s offers to expired and return exactly the rows flipped.
+def _returning_status(db: Session, stmt, status: OfferStatus) -> list[ClosedOffer]:
+    """Flip ``stmt``'s offers to ``status`` and return exactly the rows flipped.
     RETURNING, not SELECT-then-UPDATE: a racing transition can't be misreported."""
     rows = db.execute(
-        stmt.values(status=OfferStatus.expired)
+        stmt.values(status=status)
         .returning(JobOffer.id, JobOffer.worker_id, JobOffer.job_id)
         .execution_options(synchronize_session=False)
     ).all()
     return [ClosedOffer(*row) for row in rows]
+
+
+def _expire_returning(db: Session, stmt) -> list[ClosedOffer]:
+    return _returning_status(db, stmt, OfferStatus.expired)
 
 
 def _expire_pending(
@@ -509,6 +470,20 @@ def _expire_pending(
     return _expire_returning(db, stmt)
 
 
+def _supersede_pending(
+    db: Session, job_id: int, *, except_offer_id: int | None = None
+) -> list[ClosedOffer]:
+    """Like ``_expire_pending``, but for offers that lost an accept race: the
+    job was taken, not merely timed out. Pushed as ``offer.taken`` either way
+    (see ``accept_offer``) — only the stored status distinguishes them."""
+    stmt = update(JobOffer).where(
+        JobOffer.job_id == job_id, JobOffer.status == OfferStatus.pending
+    )
+    if except_offer_id is not None:
+        stmt = stmt.where(JobOffer.id != except_offer_id)
+    return _returning_status(db, stmt, OfferStatus.superseded)
+
+
 def _own_offer(db: Session, offer_id: int, worker_id: int) -> JobOffer:
     offer = db.get(JobOffer, offer_id)
     # Another worker's (or company's) offer is indistinguishable from a
@@ -519,14 +494,19 @@ def _own_offer(db: Session, offer_id: int, worker_id: int) -> JobOffer:
 
 
 def _refuse_unavailable(offer: JobOffer, job: Job, now: datetime) -> None:
-    """Explain why ``offer`` can't be acted on, or return if it still can."""
-    if offer.status is OfferStatus.accepted:
-        raise Conflict("Offer already accepted")
+    """Explain why ``offer`` can't be acted on, or return if it still can.
+
+    Callers check their own idempotent-repeat case (``offer.status`` already
+    matching the action they're performing) before calling this, so by the
+    time we get here a ``pending``-looking status is genuinely actionable.
+    """
     if job.assigned_worker_id is not None:
         raise Conflict("Job already assigned")
+    if offer.status is OfferStatus.accepted:
+        raise Conflict("Offer already accepted")
     if offer.status is OfferStatus.declined:
         raise Conflict("Offer already declined")
-    if offer.status is OfferStatus.expired or offer.expires_at <= now:
+    if offer.status in (OfferStatus.expired, OfferStatus.superseded) or offer.expires_at <= now:
         raise Gone("Offer expired")
     if job.status is not JobStatus.dispatching:
         raise Conflict("Job is no longer dispatching")
@@ -538,6 +518,10 @@ def accept_offer(
     now = now or utcnow()
     offer = _own_offer(db, offer_id, worker_id)
     job = db.get(Job, offer.job_id)
+    if offer.status is OfferStatus.accepted:
+        # Idempotent repeat: only this worker's own prior accept can have put
+        # their own offer in this state (uq_job_offers_job_worker).
+        return offer
     _refuse_unavailable(offer, job, now)
 
     # The race guard. Two workers holding distinct pending offers for this
@@ -552,6 +536,15 @@ def accept_offer(
             assigned_worker_id=worker_id,
         )
     except (StaleJob, IllegalTransition):
+        # Refresh before rolling back: a concurrent duplicate request from
+        # this *same* worker may have just won this race and committed. That
+        # read must happen before any rollback, or it would see our own
+        # pre-guard state instead of the winner's.
+        db.refresh(job)
+        if job.assigned_worker_id == worker_id:
+            db.refresh(offer)
+            if offer.status is OfferStatus.accepted:
+                return offer
         db.rollback()
         raise Conflict("Job already assigned") from None
     accepted = _conditional_update(
@@ -570,7 +563,8 @@ def accept_offer(
         db.rollback()
         raise Gone("Offer expired")
     company_id = offer.company_id
-    losers = _expire_pending(db, offer.job_id, except_offer_id=offer_id)
+    losers = _supersede_pending(db, offer.job_id, except_offer_id=offer_id)
+    job_updated = _job_updated_event(job)
     try:
         db.commit()
     except IntegrityError:
@@ -578,6 +572,7 @@ def accept_offer(
         db.rollback()
         raise Conflict("Job already assigned") from None
     _publish(company_id, _closed_events("offer.taken", losers))
+    _publish_job_updated(company_id, job_updated)
     db.refresh(offer)
     return offer
 
@@ -590,10 +585,13 @@ def decline_offer(
     now = now or utcnow()
     offer = _own_offer(db, offer_id, worker_id)
     job = db.get(Job, offer.job_id)
+    if offer.status is OfferStatus.declined:
+        # Idempotent repeat.
+        return offer
     if offer.status is OfferStatus.accepted:
         raise Conflict("Offer already accepted")
-    if offer.status is OfferStatus.declined:
-        raise Conflict("Offer already declined")
+    if offer.status is OfferStatus.superseded:
+        raise Conflict("Job already assigned")
     if offer.status is OfferStatus.expired or offer.expires_at <= now:
         raise Gone("Offer expired")
 
@@ -609,6 +607,11 @@ def decline_offer(
         .values(status=OfferStatus.declined),
     )
     if declined != 1:
+        # A concurrent duplicate request from this same worker may have just
+        # declined it; check before rolling back, same reasoning as accept.
+        db.refresh(offer)
+        if offer.status is OfferStatus.declined:
+            return offer
         db.rollback()
         raise Conflict("Offer is no longer pending")
     db.refresh(job)
@@ -752,6 +755,7 @@ def sweep(db: Session, company_id: int, *, now: datetime | None = None) -> Sweep
             if job is None:
                 continue
             events: list[tuple[int, OfferEvent]] = []
+            job_updated = None
             if re_offer_job(db, job, now=now):
                 rejobs += 1
                 # re_offer_job only proceeds with zero pending offers, so
@@ -764,9 +768,48 @@ def sweep(db: Session, company_id: int, *, now: datetime | None = None) -> Sweep
                 events = _created_events(db, job, new_offers)
             elif job.status is JobStatus.unfilled:
                 unfilled += 1
+                # The dispatcher is notified: nobody was left to offer it to.
+                job_updated = _job_updated_event(job)
             db.commit()
             _publish(company_id, events)
+            if job_updated is not None:
+                _publish_job_updated(company_id, job_updated)
         except SQLAlchemyError:
             db.rollback()
             logger.exception("dispatch sweep: re-offer failed for job %s", job_id)
     return SweepSummary(expiry.expired_count, rejobs, unfilled)
+
+
+def sweep_all_companies(
+    db_factory: Callable[[], Session] = SessionLocal, *, now: datetime | None = None
+) -> dict[int, SweepSummary]:
+    """Run ``sweep`` for every company, each on its own session.
+
+    Called by the bounded background task started in the FastAPI lifespan
+    (``app/main.py``), and directly by tests with a ``db_factory`` bound to
+    an independent engine. ``Company`` isn't ``TenantScoped``, so listing
+    its ids needs no tenant context; each company's own session then gets
+    one set via ``db.info[TENANT_INFO_KEY]``, the same mechanism
+    ``get_tenant_db`` uses for a request (``app/auth/deps.py``).
+
+    One company's failure is logged and skipped, exactly like one job's
+    failure inside ``sweep`` itself -- a bad company must never block the
+    rest of the pass.
+    """
+    db = db_factory()
+    try:
+        company_ids = db.scalars(select(Company.id).order_by(Company.id)).all()
+    finally:
+        db.close()
+
+    summaries: dict[int, SweepSummary] = {}
+    for company_id in company_ids:
+        db = db_factory()
+        try:
+            db.info[TENANT_INFO_KEY] = company_id
+            summaries[company_id] = sweep(db, company_id, now=now)
+        except Exception:
+            logger.exception("dispatch sweep: failed for company %s", company_id)
+        finally:
+            db.close()
+    return summaries

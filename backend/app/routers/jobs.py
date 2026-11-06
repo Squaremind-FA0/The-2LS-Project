@@ -63,6 +63,22 @@ def update_job(
     return JobOut.model_validate(job)
 
 
+@router.post("/{job_id}/dispatch", response_model=JobOut)
+def dispatch_job(
+    job_id: int,
+    user: User = Depends(_staff),
+    db: Session = Depends(get_tenant_db),
+) -> JobOut:
+    """Alias of PATCH /api/jobs/{job_id} {"status": "dispatching"}, with no
+    version check (this endpoint's contract has none). Moves a draft job
+    straight to dispatching and offers it to the nearest ring."""
+    try:
+        job = service.transition_job(db, job_id, JobStatus.dispatching, actor_id=user.id)
+    except service.DispatchError as exc:
+        raise_http(exc)
+    return JobOut.model_validate(job)
+
+
 @router.post("/{job_id}/cancel", response_model=JobOut)
 def cancel_job(
     job_id: int,

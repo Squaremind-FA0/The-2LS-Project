@@ -53,6 +53,16 @@ def pending_offers(
     return service.list_pending_offers(db, user.id, limit=limit)
 
 
+@router.get("/api/me/offers", response_model=list[PendingOfferOut])
+def my_offers(
+    limit: int = Query(200, ge=1, le=200),
+    user: User = Depends(_worker),
+    db: Session = Depends(get_tenant_db),
+) -> list[PendingOfferOut]:
+    """Alias of GET /api/offers/pending."""
+    return service.list_pending_offers(db, user.id, limit=limit)
+
+
 @router.post("/api/offers/{offer_id}/accept", response_model=JobOfferOut)
 def accept_offer(
     offer_id: int, user: User = Depends(_worker), db: Session = Depends(get_tenant_db)

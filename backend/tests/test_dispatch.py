@@ -26,7 +26,6 @@ from app.models import (
     Shift,
     User,
     WorkerLocation,
-    WorkerProfile,
 )
 from app.models.job import utcnow
 from app.services import dispatch
@@ -206,121 +205,10 @@ def test_sqlite_engine_uses_wal_and_busy_timeout(db_file_based):
 
 
 # --- Phase 3: matching (tasks 9-10) ---------------------------------------------------------
-
-
-def test_haversine_matches_known_distance():
-    # Sydney -> Melbourne is ~713.4 km great-circle.
-    assert dispatch.haversine_km(-33.8688, 151.2093, -37.8136, 144.9631) == pytest.approx(
-        713.4, abs=1.0
-    )
-    assert dispatch.haversine_km(JOB_LAT, JOB_LNG, north_of(JOB_LAT, 9.9), JOB_LNG) == (
-        pytest.approx(9.9, abs=1e-6)
-    )
-
-
-def test_bounding_box_contains_radius():
-    box = dispatch.bounding_box(JOB_LAT, JOB_LNG, 10.0)
-    assert box.min_lat < north_of(JOB_LAT, -10) and box.max_lat > north_of(JOB_LAT, 10)
-    assert box.min_lng < JOB_LNG < box.max_lng
-    # 10 km east must sit inside the longitude window.
-    east = JOB_LNG + 10 / (KM_PER_DEG_LAT * math.cos(math.radians(JOB_LAT)))
-    assert box.min_lng < east < box.max_lng
-
-
-def test_bounding_box_near_antimeridian_skips_lng_filter():
-    assert dispatch.bounding_box(0.0, 179.99, 10.0).min_lng is None
-
-
-def test_radius_boundary_9_9km_matched_10_1km_not(transactional_db, two_companies):
-    a, _ = two_companies
-    near = add_worker(transactional_db, a.id, "near", 9.9)
-    add_worker(transactional_db, a.id, "far", 10.1)
-    job_id = add_job(transactional_db, a.id)
-
-    assert match_ids(transactional_db, a.id, job_id) == [near.id]
-
-
-def test_cross_company_worker_never_matched(transactional_db, two_companies):
-    a, b = two_companies
-    add_worker(transactional_db, b.id, "rival", 1.0)
-    job_id = add_job(transactional_db, a.id)
-
-    assert match_ids(transactional_db, a.id, job_id) == []
-
-
-def test_trade_must_match(transactional_db, two_companies):
-    a, _ = two_companies
-    add_worker(transactional_db, a.id, "sparky", 1.0, trades=("electrical",))
-    job_id = add_job(transactional_db, a.id, trade="plumbing")
-
-    assert match_ids(transactional_db, a.id, job_id) == []
-
-
-def test_trade_match_is_case_insensitive(transactional_db, two_companies):
-    a, _ = two_companies
-    w = add_worker(transactional_db, a.id, "caps", 1.0, trades=("Plumbing",))
-    job_id = add_job(transactional_db, a.id, trade="plumbing")
-
-    assert match_ids(transactional_db, a.id, job_id) == [w.id]
-
-
-def test_stale_location_excluded(transactional_db, two_companies):
-    a, _ = two_companies
-    fresh = add_worker(transactional_db, a.id, "fresh", 2.0, age=timedelta(minutes=4))
-    add_worker(transactional_db, a.id, "stale", 1.0, age=timedelta(hours=1))
-    job_id = add_job(transactional_db, a.id)
-
-    assert match_ids(transactional_db, a.id, job_id) == [fresh.id]
-
-
-def test_results_sorted_nearest_first(transactional_db, two_companies):
-    a, _ = two_companies
-    w3 = add_worker(transactional_db, a.id, "w3", 7.0)
-    w1 = add_worker(transactional_db, a.id, "w1", 0.5)
-    w2 = add_worker(transactional_db, a.id, "w2", 3.0)
-    job_id = add_job(transactional_db, a.id)
-
-    assert match_ids(transactional_db, a.id, job_id) == [w1.id, w2.id, w3.id]
-
-
-def test_limit_caps_results(transactional_db, two_companies):
-    a, _ = two_companies
-    w1 = add_worker(transactional_db, a.id, "w1", 0.5)
-    add_worker(transactional_db, a.id, "w2", 3.0)
-    job_id = add_job(transactional_db, a.id)
-
-    assert match_ids(transactional_db, a.id, job_id, limit=1) == [w1.id]
-
-
-def test_inactive_users_and_profiles_excluded(transactional_db, two_companies):
-    a, _ = two_companies
-    off_user = add_worker(transactional_db, a.id, "offuser", 1.0)
-    off_profile = add_worker(transactional_db, a.id, "offprofile", 1.5)
-    ok = add_worker(transactional_db, a.id, "ok", 2.0)
-    with tenant_context(transactional_db, a.id):
-        transactional_db.get(User, off_user.id).is_active = False
-        transactional_db.scalars(
-            select(WorkerProfile).where(WorkerProfile.user_id == off_profile.id)
-        ).one().active = False
-        transactional_db.flush()
-    job_id = add_job(transactional_db, a.id)
-
-    assert match_ids(transactional_db, a.id, job_id) == [ok.id]
-
-
-def test_workers_already_offered_this_job_excluded(transactional_db, two_companies):
-    a, _ = two_companies
-    offered = add_worker(transactional_db, a.id, "offered", 1.0)
-    other = add_worker(transactional_db, a.id, "other", 2.0)
-    job_id = add_job(transactional_db, a.id, status=JobStatus.dispatching)
-    with tenant_context(transactional_db, a.id):
-        transactional_db.add(
-            JobOffer(job_id=job_id, worker_id=offered.id, status=OfferStatus.declined,
-                     expires_at=utcnow())
-        )
-        transactional_db.flush()
-
-    assert match_ids(transactional_db, a.id, job_id) == [other.id]
+#
+# Moved to tests/test_matcher.py (M4): haversine/bounding-box/trade/radius/
+# cross-company/ordering/availability coverage of app.dispatch.matcher and
+# find_nearby_workers now lives there.
 
 
 # --- Phase 4: jobs API, location, offer flow (tasks 11-14) ---------------------------------
@@ -432,6 +320,23 @@ def test_offering_transition_offers_nearest_ring(client, two_companies, transact
         assert now < offer.expires_at <= now + timedelta(seconds=settings.DISPATCH_OFFER_TTL_S)
 
 
+def test_dispatch_ring_size_defaults_to_three(client, two_companies, transactional_db):
+    from app.config import settings
+
+    assert settings.DISPATCH_RING_SIZE == 3
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    w2 = add_worker(transactional_db, a.id, "w2", 2.0)
+    w3 = add_worker(transactional_db, a.id, "w3", 3.0)
+    add_worker(transactional_db, a.id, "w4", 4.0)
+    job_id = add_job(transactional_db, a.id)
+
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+
+    offers = offers_for(transactional_db, a.id, job_id)
+    assert set(offers) == {w1.id, w2.id, w3.id}
+
+
 @pytest.mark.parametrize(
     ("start", "target"),
     [
@@ -530,19 +435,21 @@ def test_accept_assigns_job_and_expires_rest_of_ring(client, two_companies, tran
     assert job.status is JobStatus.assigned and job.assigned_worker_id == w2.id
     offers = offers_for(transactional_db, a.id, job_id)
     assert offers[w2.id].status is OfferStatus.accepted
-    assert offers[w1.id].status is OfferStatus.expired
+    assert offers[w1.id].status is OfferStatus.superseded
 
 
-def test_accepting_twice_is_409(client, two_companies, transactional_db):
+def test_accepting_twice_is_idempotent(client, two_companies, transactional_db):
     a, _ = two_companies
     w1 = add_worker(transactional_db, a.id, "w1", 1.0)
     job_id = add_job(transactional_db, a.id)
     start_offering(client, a.dispatcher, job_id)
     offer_id = offers_for(transactional_db, a.id, job_id)[w1.id].id
 
-    assert client.post(f"/api/offers/{offer_id}/accept", headers=auth_header(w1)).is_success
-    assert client.post(f"/api/offers/{offer_id}/accept",
-                       headers=auth_header(w1)).status_code == 409
+    first = client.post(f"/api/offers/{offer_id}/accept", headers=auth_header(w1))
+    second = client.post(f"/api/offers/{offer_id}/accept", headers=auth_header(w1))
+
+    assert first.is_success and second.status_code == 200
+    assert first.json() == second.json()
 
 
 def test_offer_of_another_worker_or_company_is_404(client, two_companies, transactional_db):
@@ -584,7 +491,71 @@ def test_accept_guard_holds_without_application_prechecks(
 
     assert second.status_code == 409
     assert fresh(transactional_db, a.id, Job, job_id).assigned_worker_id == w1.id
-    assert offers_for(transactional_db, a.id, job_id)[w2.id].status is OfferStatus.expired
+    assert offers_for(transactional_db, a.id, job_id)[w2.id].status is OfferStatus.superseded
+
+
+def test_accept_idempotent_under_a_forced_stale_read(
+    client, two_companies, transactional_db, monkeypatch
+):
+    """Deterministic version of a same-worker duplicate request racing itself.
+
+    On this project's SQLite engine (BEGIN IMMEDIATE on every transaction), a
+    real concurrent duplicate request blocks at its own first query (the auth
+    lookup) until the winner commits, so by the time it reads the offer it
+    already sees ``accepted`` and returns via the early check in
+    ``accept_offer`` -- it never reaches the ``except (StaleJob,
+    IllegalTransition)`` branch. Only a forced stale read exercises that
+    branch; a concurrent-thread test alone would not (project lesson).
+    """
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    offer = offers_for(transactional_db, a.id, job_id)[w1.id]
+
+    def _simulate_concurrent_duplicate_winner(offer_arg, job_arg, now_arg):
+        # A duplicate request from this same worker has already won and
+        # committed: flush that state in so the conditional UPDATE's guard
+        # (assigned_worker_id IS NULL) fails exactly as it would for real.
+        job_arg.status = JobStatus.assigned
+        job_arg.assigned_worker_id = w1.id
+        offer_arg.status = OfferStatus.accepted
+        transactional_db.flush()
+
+    monkeypatch.setattr(dispatch, "_refuse_unavailable", _simulate_concurrent_duplicate_winner)
+
+    with tenant_context(transactional_db, a.id):
+        result = dispatch.accept_offer(transactional_db, offer.id, w1.id)
+
+    assert result.id == offer.id
+    assert result.status is OfferStatus.accepted
+
+
+def test_decline_idempotent_under_a_forced_stale_read(
+    client, two_companies, transactional_db, monkeypatch
+):
+    """Deterministic version of the same race for decline: see
+    test_accept_idempotent_under_a_forced_stale_read."""
+    a, _ = two_companies
+    w1 = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+    offer = offers_for(transactional_db, a.id, job_id)[w1.id]
+    real_conditional_update = dispatch._conditional_update
+
+    def _simulate_concurrent_duplicate_decline(db_arg, stmt):
+        row = db_arg.get(JobOffer, offer.id)
+        row.status = OfferStatus.declined
+        db_arg.flush()
+        return real_conditional_update(db_arg, stmt)
+
+    monkeypatch.setattr(dispatch, "_conditional_update", _simulate_concurrent_duplicate_decline)
+
+    with tenant_context(transactional_db, a.id):
+        result = dispatch.decline_offer(transactional_db, offer.id, w1.id)
+
+    assert result.id == offer.id
+    assert result.status is OfferStatus.declined
 
 
 def test_db_rejects_second_accepted_offer_for_a_job(transactional_db, two_companies):
@@ -659,13 +630,18 @@ def test_concurrent_ring_double_accept_one_wins(db_file_based, file_company, att
         assert job.assigned_worker_id == winner.id
         final = offers_for(db, file_company.id, job_id)
         assert final[winner.id].status is OfferStatus.accepted
-        assert final[loser.id].status is OfferStatus.expired
+        assert final[loser.id].status is OfferStatus.superseded
         # Assigned: no new offers can be created for it.
         with tenant_context(db, file_company.id):
             assert dispatch.create_offers(db, job) == []
 
 
 def test_concurrent_same_offer_double_accept(db_file_based, file_company):
+    """Four concurrent accepts from the *same* worker on their own offer are
+    all idempotent: exactly one does the real work, the rest see it already
+    accepted (whether through the early return or, in principle, the forced
+    stale-read branch -- see test_accept_idempotent_under_a_forced_stale_read
+    for why real concurrency here only ever exercises the former)."""
     job_id, (w1,) = _seed_offering_job(db_file_based, file_company, 1)
     offer_id = _offering_via_api(db_file_based, file_company, job_id)[w1.id].id
 
@@ -673,7 +649,9 @@ def test_concurrent_same_offer_double_accept(db_file_based, file_company):
         [("POST", f"/api/offers/{offer_id}/accept", {"headers": auth_header(w1)})] * 4
     )
 
-    assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
+    assert [r.status_code for r in responses] == [200, 200, 200, 200]
+    bodies = [r.json() for r in responses]
+    assert all(body == bodies[0] for body in bodies)
 
 
 # --- Phase 5: expiry + sweeper (tasks 15-17) -------------------------------------------------
@@ -732,7 +710,7 @@ def test_decline_triggers_next_offer(client, two_companies, transactional_db, mo
     assert offers[second.id].status is OfferStatus.pending
     assert fresh(transactional_db, a.id, Job, job_id).status is JobStatus.dispatching
     again = client.post(f"/api/offers/{declined_id}/decline", headers=auth_header(nearest))
-    assert again.status_code == 409
+    assert again.status_code == 200 and again.json() == response.json()
 
 
 def test_decline_tops_up_a_partially_pending_ring(client, two_companies, transactional_db,
@@ -891,7 +869,7 @@ def test_e2e_job_dispatch_flow(client, two_companies, transactional_db):
     assert [(j["id"], j["assigned_worker_id"]) for j in listed] == [(job_id, w1.id)]
     final = offers_for(transactional_db, a.id, job_id)
     assert final[w1.id].status is OfferStatus.accepted
-    assert final[w2.id].status is OfferStatus.expired
+    assert final[w2.id].status is OfferStatus.superseded
 
 
 # --- Uncovered defensive paths and edge cases (tasks 9-17) -----------------------------------
@@ -969,9 +947,7 @@ def test_offer_expired_between_read_and_accept_returns_410(
     assert response.json()["detail"] == "Offer expired"
 
 
-def test_decline_when_offer_already_declined_is_409(client, two_companies, transactional_db,
-                                                   monkeypatch):
-    """Decline an offer that's already declined: line 403-404."""
+def test_declining_twice_is_idempotent(client, two_companies, transactional_db, monkeypatch):
     from app.config import settings
 
     monkeypatch.setattr(settings, "DISPATCH_RING_SIZE", 2)
@@ -987,10 +963,10 @@ def test_decline_when_offer_already_declined_is_409(client, two_companies, trans
     r1 = client.post(f"/api/offers/{offer_id}/decline", headers=auth_header(w1))
     assert r1.status_code == 200
 
-    # Second decline on same offer fails
+    # Repeating it is idempotent, not a conflict
     r2 = client.post(f"/api/offers/{offer_id}/decline", headers=auth_header(w1))
-    assert r2.status_code == 409
-    assert r2.json()["detail"] == "Offer already declined"
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
 
 
 def test_accept_and_decline_race_on_same_offer(db_file_based, file_company):
@@ -1171,3 +1147,106 @@ def test_sweep_continues_on_job_error(client, two_companies, transactional_db, m
     assert response.status_code == 200
     summary = response.json()
     assert summary["expired_count"] >= 2
+
+
+# --- M4: background sweep orchestration across every company -------------------------------
+#
+# Uses db_file_based directly (not the client/transactional_db fixtures):
+# sweep_all_companies opens its own sessions via an injectable db_factory,
+# and exercising that against the shared in-memory/StaticPool test engine
+# while another session holds it mid-transaction raises "cannot start a
+# transaction within a transaction" (G4's documented failure mode).
+
+
+def test_sweep_all_companies_sweeps_every_company_independently(db_file_based, monkeypatch):
+    with db_file_based() as db:
+        company_a = make_company(db, "sweepa", "Sweep A")
+        company_b = make_company(db, "sweepb", "Sweep B")
+        db.commit()
+    job_a, _ = _seed_offering_job(db_file_based, company_a, 1)
+    job_b, _ = _seed_offering_job(db_file_based, company_b, 1)
+    _offering_via_api(db_file_based, company_a, job_a)
+    _offering_via_api(db_file_based, company_b, job_b)
+    with db_file_based() as db:
+        expire_offers_now(db, company_a.id, job_a)
+        expire_offers_now(db, company_b.id, job_b)
+        db.commit()
+
+    real_sweep = dispatch.sweep
+
+    def _flaky_sweep(db, company_id, **kwargs):
+        if company_id == company_b.id:
+            raise RuntimeError("boom")
+        return real_sweep(db, company_id, **kwargs)
+
+    monkeypatch.setattr(dispatch, "sweep", _flaky_sweep)
+
+    summaries = dispatch.sweep_all_companies(db_factory=db_file_based)
+
+    assert summaries[company_a.id].expired_count == 1
+    assert company_b.id not in summaries  # company B's exception was caught and skipped
+    with db_file_based() as db:
+        assert fresh(db, company_a.id, Job, job_a).status is JobStatus.unfilled
+        # Untouched: company B's own sweep never ran, so its offer is still
+        # pending even though its expires_at is already in the past.
+        offer_b = next(iter(offers_for(db, company_b.id, job_b).values()))
+        assert offer_b.status is OfferStatus.pending
+
+
+def test_lifespan_starts_and_cancels_the_sweep_loop(monkeypatch):
+    """with TestClient(app): is the one way to trigger FastAPI's lifespan in
+    this Starlette version -- the client/transactional_db fixtures never do,
+    by design (they construct TestClient(app) without a `with`), so this
+    test runs against the plain default engine with no companies seeded and
+    without either fixture."""
+    import time as time_module
+
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISPATCH_SWEEP_INTERVAL_S", 0.05)
+    calls = []
+    monkeypatch.setattr(
+        dispatch, "sweep_all_companies", lambda *a, **k: calls.append(1) or {}
+    )
+
+    with TestClient(app):
+        time_module.sleep(0.2)
+
+    assert calls
+
+
+# --- M4: REST aliases -------------------------------------------------------------------
+
+
+def test_post_jobs_dispatch_alias_matches_patch_status_dispatching(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_a = add_job(transactional_db, a.id)
+    job_b = add_job(transactional_db, a.id)
+
+    via_patch = start_offering(client, a.dispatcher, job_a)
+    via_alias = client.post(f"/api/jobs/{job_b}/dispatch", headers=auth_header(a.dispatcher))
+
+    assert via_patch.status_code == via_alias.status_code == 200
+    for key in ("status", "offer_round", "assigned_worker_id"):
+        assert via_patch.json()[key] == via_alias.json()[key]
+    assert offers_for(transactional_db, a.id, job_a) and offers_for(
+        transactional_db, a.id, job_b
+    )
+
+
+def test_get_me_offers_alias_matches_offers_pending(client, two_companies, transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    start_offering(client, a.dispatcher, job_id)
+
+    via_pending = client.get("/api/offers/pending", headers=auth_header(w))
+    via_alias = client.get("/api/me/offers", headers=auth_header(w))
+
+    assert via_pending.status_code == via_alias.status_code == 200
+    assert via_pending.json() == via_alias.json()

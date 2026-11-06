@@ -14,9 +14,14 @@ class Settings(BaseSettings):
     # and the sweeper's re-offer bound.
     DISPATCH_RADIUS_KM: float = 10.0
     DISPATCH_LOCATION_MAX_AGE_MIN: float = 5.0
-    DISPATCH_RING_SIZE: int = 10
+    DISPATCH_RING_SIZE: int = 3
     DISPATCH_OFFER_TTL_S: int = 30
     DISPATCH_MAX_ROUNDS: int = 5
+    # M4: cadence of the bounded background sweep started in the FastAPI
+    # lifespan. A lazy check on read (GET /api/offers/pending, the accept/
+    # decline guards) already treats a past-expires_at offer as inert
+    # independent of this, so a missed or delayed tick is never unsafe.
+    DISPATCH_SWEEP_INTERVAL_S: float = 10.0
 
     # Realtime offer push (G4): first-message auth deadline, server heartbeat
     # period (a peer silent for two periods is dropped) and per-connection

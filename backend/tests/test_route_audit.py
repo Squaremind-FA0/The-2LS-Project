@@ -125,12 +125,15 @@ def test_audit_actually_sees_the_api_routes():
     assert {
         "/api/jobs",
         "/api/jobs/{job_id}",
+        "/api/jobs/{job_id}/dispatch",
         "/api/workers/me/location",
         "/api/offers/pending",
         "/api/offers/{offer_id}/accept",
         "/api/offers/{offer_id}/decline",
+        "/api/me/offers",
         "/api/dispatch/sweep",
         "/api/ws/worker",
+        "/api/ws/company",
     } <= guarded
     assert {
         "/api/shifts",
@@ -159,9 +162,11 @@ def test_dispatch_routes_require_the_prp_roles():
         ("PATCH", "/api/jobs/{job_id}"): {"dispatcher", "company_admin"},
         ("DELETE", "/api/jobs/{job_id}"): {"dispatcher", "company_admin"},
         ("POST", "/api/jobs/{job_id}/cancel"): {"dispatcher", "company_admin"},
+        ("POST", "/api/jobs/{job_id}/dispatch"): {"dispatcher", "company_admin"},
         ("PATCH", "/api/me/location"): {"worker"},
         ("PATCH", "/api/me/availability"): {"worker"},
         ("GET", "/api/me/jobs"): {"worker"},
+        ("GET", "/api/me/offers"): {"worker"},
         ("POST", "/api/me/jobs/{job_id}/start"): {"worker"},
         ("POST", "/api/me/jobs/{job_id}/complete"): {"worker"},
         ("PUT", "/api/workers/me/location"): {"worker"},
@@ -189,6 +194,16 @@ def test_ws_worker_route_requires_the_worker_role():
         for role in getattr(dep.call, REQUIRE_WS_ROLE_MARKER, ())
     }
     assert roles == {"worker"}
+
+
+def test_ws_company_route_requires_dispatcher_or_admin_role():
+    [route] = [r for r in api_routes(app) if r.path == "/api/ws/company"]
+    roles = {
+        role.value
+        for dep in _walk(route.dependant)
+        for role in getattr(dep.call, REQUIRE_WS_ROLE_MARKER, ())
+    }
+    assert roles == {"dispatcher", "company_admin"}
 
 
 def test_roster_and_payroll_routes_require_the_prp_roles():

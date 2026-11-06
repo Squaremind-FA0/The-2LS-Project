@@ -638,6 +638,74 @@ def test_every_api_websocket_route_rejects_unauthenticated(client, monkeypatch):
             assert closed_with(ws) == 4401
 
 
+@contextmanager
+def company_socket(client, user):
+    with client.websocket_connect("/api/ws/company") as ws:
+        ws.send_json({"type": "auth", "token": token_for(user)})
+        assert recv(ws) == {"type": "auth.ok"}
+        yield ws
+
+
+def test_company_channel_receives_job_updated_on_dispatch(client, two_companies,
+                                                           transactional_db):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    with company_socket(client, a.dispatcher) as ws:
+        assert start_offering(client, a.dispatcher, job_id).status_code == 200
+        event = recv(ws)
+    assert event["type"] == "job.updated"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["status"] == "dispatching"
+
+
+def test_company_channel_receives_job_updated_on_accept(client, two_companies,
+                                                          transactional_db):
+    a, _ = two_companies
+    w = add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    offer = offers_for(transactional_db, a.id, job_id)[w.id]
+    with company_socket(client, a.admin) as ws:
+        assert client.post(f"/api/offers/{offer.id}/accept",
+                           headers=auth_header(w)).status_code == 200
+        event = recv(ws)
+    assert event["type"] == "job.updated"
+    assert event["job"]["status"] == "assigned"
+    assert event["job"]["assigned_worker_id"] == w.id
+
+
+def test_company_channel_receives_job_updated_on_unfilled(client, two_companies,
+                                                           transactional_db):
+    a, _ = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    assert start_offering(client, a.dispatcher, job_id).status_code == 200
+    expire_offers_now(transactional_db, a.id, job_id)
+    with company_socket(client, a.dispatcher) as ws:
+        assert sweep_request(client, a.admin).status_code == 200
+        event = recv(ws)
+    assert event["type"] == "job.updated"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["status"] == "unfilled"
+
+
+def test_company_socket_rejects_a_worker_4403(client, two_companies):
+    a, _ = two_companies
+    with client.websocket_connect("/api/ws/company") as ws:
+        ws.send_json({"type": "auth", "token": token_for(a.worker)})
+        assert closed_with(ws) == 4403
+
+
+def test_company_channel_is_isolated_per_company(client, two_companies, transactional_db):
+    a, b = two_companies
+    add_worker(transactional_db, a.id, "w1", 1.0)
+    job_id = add_job(transactional_db, a.id)
+    with company_socket(client, b.dispatcher) as ws:
+        assert start_offering(client, a.dispatcher, job_id).status_code == 200
+        assert_quiet(ws)
+
+
 def test_open_socket_does_not_hold_the_sqlite_write_lock(db_file_based, file_company):  # noqa: F811
     """Real file database, real commits: every transaction is BEGIN IMMEDIATE,
     so a socket that kept its session open would block this write for the

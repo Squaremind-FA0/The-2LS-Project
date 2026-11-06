@@ -16,6 +16,9 @@ class OfferStatus(str, enum.Enum):
     accepted = "accepted"
     declined = "declined"
     expired = "expired"
+    # Lost an accept race: another worker's accept won the job first. Distinct
+    # from expired (timed out unraced) and from a cancel's bulk expiry.
+    superseded = "superseded"
 
 
 # Partial unique index: the database itself refuses a second accepted offer

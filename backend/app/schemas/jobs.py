@@ -187,3 +187,15 @@ class OfferClosedEvent(BaseModel):
 
 
 OfferEvent = OfferCreatedEvent | OfferClosedEvent
+
+
+class JobUpdatedEvent(BaseModel):
+    """Pushed on the dispatcher-facing company:{id} channel (WS /api/ws/company)
+    whenever a job's status changes: dispatched, cancelled, assigned, or
+    left unfilled."""
+
+    type: Literal["job.updated"] = "job.updated"
+    job: JobOut
+
+
+CompanyEvent = JobUpdatedEvent
