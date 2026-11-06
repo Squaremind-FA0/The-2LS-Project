@@ -76,14 +76,14 @@ describe('resource functions', () => {
   it('address the documented endpoints', async () => {
     const fetchMock = mockFetch({
       'POST /offers/7/accept': { body: { id: 7 } },
-      'POST /jobs/3/clock-in': { body: { id: 1 } },
-      'POST /jobs/3/clock-out': { body: { id: 1 } },
+      'POST /me/jobs/3/start': { body: { id: 3 } },
+      'POST /me/jobs/3/complete': { body: { id: 3 } },
       'PATCH /payruns/2': { body: { id: 2 } },
       'GET /jobs?status=draft&limit=5': { body: [] },
     });
     await offers.accept(7);
-    await jobs.clockIn(3);
-    await jobs.clockOut(3);
+    await jobs.start(3);
+    await jobs.complete(3);
     await payruns.transition(2, 'approved');
     await jobs.list({ status: 'draft', limit: 5 });
     expect(sentBodies(fetchMock, 'PATCH /payruns/2')).toEqual([{ status: 'approved' }]);

@@ -107,8 +107,8 @@ export const jobs = {
   list: (params) => apiRequest(withQuery('/jobs', params)),
   transition: (jobId, status, version) =>
     apiRequest(`/jobs/${id(jobId)}`, { method: 'PATCH', json: { version, status } }),
-  clockIn: (jobId) => apiRequest(`/jobs/${id(jobId)}/clock-in`, { method: 'POST' }),
-  clockOut: (jobId) => apiRequest(`/jobs/${id(jobId)}/clock-out`, { method: 'POST' }),
+  start: (jobId) => apiRequest(`/me/jobs/${id(jobId)}/start`, { method: 'POST' }),
+  complete: (jobId) => apiRequest(`/me/jobs/${id(jobId)}/complete`, { method: 'POST' }),
 };
 
 export const offers = {

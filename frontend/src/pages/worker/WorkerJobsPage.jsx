@@ -5,8 +5,8 @@ import { formatUtc } from '../../api/time.js';
 import { useOffers } from '../../offers/OfferProvider.jsx';
 
 const NEXT_STEP = {
-  assigned: { label: 'Start', call: jobsApi.clockIn, status: 'in_progress' },
-  in_progress: { label: 'Complete', call: jobsApi.clockOut, status: 'completed' },
+  assigned: { label: 'Start', call: jobsApi.start, status: 'in_progress' },
+  in_progress: { label: 'Complete', call: jobsApi.complete, status: 'completed' },
 };
 
 function JobCard({ job, onStatus }) {

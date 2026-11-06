@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.roster.router import router as roster_router
-from app.routers import auth, dispatch, jobs, me, payruns, shifts, time_entries, workers, ws
+from app.routers import auth, dispatch, jobs, me, payruns, shifts, workers, ws
 from app.services import dispatch as dispatch_service
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,6 @@ app.include_router(jobs.router)
 app.include_router(dispatch.router)
 app.include_router(ws.router)
 app.include_router(shifts.router)
-app.include_router(time_entries.router)
 app.include_router(payruns.router)
 app.include_router(roster_router)
 

@@ -64,12 +64,13 @@ describe('WorkerJobsPage', () => {
     expect(screen.getByText(/only.*accepted on this device/i)).toBeInTheDocument();
   });
 
-  it('WorkerJobsPage Start/Complete call clock-in/clock-out and move the job through in_progress to completed', async () => {
+  it('WorkerJobsPage Start/Complete call start/complete and move the job through in_progress to completed', async () => {
+    const jobResponse = { id: 9, title: 'Fix tap', status: 'assigned', trade: 'plumbing', address: '1 Pipe St', lat: 1, lng: 2, scheduled_for: null, assigned_worker_id: 11, offer_round: 1, created_by: null, version: 1, created_at: '2026-11-05T09:59:00', updated_at: '2026-11-05T09:59:00' };
     const fetchMock = mockFetch({
       'GET /offers/pending': { body: [offer()] },
       'POST /offers/1/accept': { body: { id: 1, status: 'accepted' } },
-      'POST /jobs/9/clock-in': { body: { id: 1, job_id: 9, worker_id: 11, started_at: '2026-11-05T10:00:00', ended_at: null } },
-      'POST /jobs/9/clock-out': { body: { id: 1, job_id: 9, worker_id: 11, started_at: '2026-11-05T10:00:00', ended_at: '2026-11-05T11:00:00' } },
+      'POST /me/jobs/9/start': { body: { ...jobResponse, status: 'in_progress' } },
+      'POST /me/jobs/9/complete': { body: { ...jobResponse, status: 'completed' } },
     });
     renderPage();
 
@@ -81,20 +82,20 @@ describe('WorkerJobsPage', () => {
 
     await userEvent.click(card.getByRole('button', { name: 'Start' }));
     expect(await card.findByText('in_progress')).toBeInTheDocument();
-    expect(fetchMock.mock.calls.some(([url, o]) => url === '/api/jobs/9/clock-in' && o.method === 'POST')).toBe(true);
+    expect(fetchMock.mock.calls.some(([url, o]) => url === '/api/me/jobs/9/start' && o.method === 'POST')).toBe(true);
     expect(card.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
 
     await userEvent.click(card.getByRole('button', { name: 'Complete' }));
     expect(await card.findByText('completed')).toBeInTheDocument();
-    expect(fetchMock.mock.calls.some(([url, o]) => url === '/api/jobs/9/clock-out' && o.method === 'POST')).toBe(true);
+    expect(fetchMock.mock.calls.some(([url, o]) => url === '/api/me/jobs/9/complete' && o.method === 'POST')).toBe(true);
     expect(card.queryByRole('button')).not.toBeInTheDocument();
   });
 
-  it('surfaces a clock-in refusal and leaves the job where it was', async () => {
+  it('surfaces a start refusal and leaves the job where it was', async () => {
     mockFetch({
       'GET /offers/pending': { body: [offer()] },
       'POST /offers/1/accept': { body: { id: 1, status: 'accepted' } },
-      'POST /jobs/9/clock-in': { status: 409, body: { detail: 'Worker is not on shift' } },
+      'POST /me/jobs/9/start': { status: 409, body: { detail: 'Worker is not on shift' } },
     });
     renderPage();
     const card = within(await acceptOffer());

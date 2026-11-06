@@ -137,8 +137,6 @@ def test_audit_actually_sees_the_api_routes():
     } <= guarded
     assert {
         "/api/shifts",
-        "/api/jobs/{job_id}/clock-in",
-        "/api/jobs/{job_id}/clock-out",
         "/api/payruns",
         "/api/payruns/{payrun_id}",
         "/api/payruns/{payrun_id}/paylines",
@@ -147,6 +145,8 @@ def test_audit_actually_sees_the_api_routes():
         "/api/roster/shifts",
         "/api/roster/shifts/{shift_id}",
         "/api/me/shifts",
+        "/api/me/jobs/{job_id}/start",
+        "/api/me/jobs/{job_id}/complete",
     } <= guarded
 
 
@@ -214,8 +214,8 @@ def test_roster_and_payroll_routes_require_the_prp_roles():
     expected = {
         ("POST", "/api/shifts"): {"worker"},
         ("GET", "/api/shifts"): {"worker"},
-        ("POST", "/api/jobs/{job_id}/clock-in"): {"worker"},
-        ("POST", "/api/jobs/{job_id}/clock-out"): {"worker"},
+        ("POST", "/api/me/jobs/{job_id}/start"): {"worker"},
+        ("POST", "/api/me/jobs/{job_id}/complete"): {"worker"},
         ("GET", "/api/payruns"): {"company_admin"},
         ("POST", "/api/payruns"): {"company_admin"},
         ("PATCH", "/api/payruns/{payrun_id}"): {"company_admin"},

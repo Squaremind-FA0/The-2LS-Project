@@ -272,7 +272,8 @@ def on_shift_worker_job(db, company, status=JobStatus.assigned) -> int:
 
 
 def clock(client, action, job_id, user):
-    return client.post(f"/api/jobs/{job_id}/clock-{action}", headers=auth_header(user))
+    endpoint = "/api/me/jobs/{}/start".format(job_id) if action == "in" else "/api/me/jobs/{}/complete".format(job_id)
+    return client.post(endpoint, headers=auth_header(user))
 
 
 def time_entries(db, company_id, job_id) -> list[TimeEntry]:
@@ -292,8 +293,10 @@ def test_clock_in_requires_assigned_and_moves_job_to_in_progress(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"id", "job_id", "worker_id", "started_at", "ended_at"}
-    assert (body["job_id"], body["worker_id"], body["ended_at"]) == (job_id, a.worker.id, None)
+    # Response is now JobOut, check for expected fields
+    assert body["id"] == job_id
+    assert body["status"] == "in_progress"
+    assert body["assigned_worker_id"] == a.worker.id
     assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.in_progress
     entry = time_entries(transactional_db, a.id, job_id)[0]
     assert before <= entry.started_at <= utcnow()
@@ -357,9 +360,10 @@ def test_clock_is_refused_for_another_workers_job_and_hidden_across_companies(
     colleague = td.add_worker(transactional_db, a.id, "colleague")
     job_id = on_shift_worker_job(transactional_db, a)
 
+    # New endpoints check ownership via _own_job and return 404 for jobs not owned by caller
+    # (no oracle: another worker's job looks missing)
     refused = clock(client, action, job_id, colleague)
-    assert refused.status_code == 409
-    assert refused.json()["detail"] == "Job not assigned to this worker"
+    assert refused.status_code == 404
     assert clock(client, action, job_id, b.worker).status_code == 404
     assert clock(client, action, 999_999, a.worker).status_code == 404
 
@@ -377,14 +381,16 @@ def test_clock_out_requires_in_progress_and_moves_job_to_completed(
 ):
     a, _ = two_companies
     job_id = on_shift_worker_job(transactional_db, a)
-    started = clock(client, "in", job_id, a.worker).json()["started_at"]
+    in_progress_resp = clock(client, "in", job_id, a.worker)
+    assert in_progress_resp.json()["status"] == "in_progress"
 
     response = clock(client, "out", job_id, a.worker)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["started_at"] == started
-    assert body["ended_at"] is not None
+    assert body["status"] == "completed"
+    # Verify time entries were created in the database
+    assert len(time_entries(transactional_db, a.id, job_id)) == 1
     assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.completed
 
 
@@ -401,13 +407,15 @@ def test_clock_out_twice_is_409(client, two_companies, transactional_db):
     a, _ = two_companies
     job_id = on_shift_worker_job(transactional_db, a)
     clock(client, "in", job_id, a.worker)
-    first = clock(client, "out", job_id, a.worker).json()["ended_at"]
+    first_response = clock(client, "out", job_id, a.worker)
+    assert first_response.status_code == 200
+    first_ended_at = time_entries(transactional_db, a.id, job_id)[0].ended_at.isoformat()
 
     again = clock(client, "out", job_id, a.worker)
 
     assert again.status_code == 409
     assert again.json()["detail"] == "TimeEntry already ended"
-    assert time_entries(transactional_db, a.id, job_id)[0].ended_at.isoformat() == first
+    assert time_entries(transactional_db, a.id, job_id)[0].ended_at.isoformat() == first_ended_at
 
 
 def test_clock_out_is_allowed_after_the_shift_ended(client, two_companies, transactional_db):
@@ -435,7 +443,11 @@ def test_clock_out_of_a_job_cancelled_mid_work_keeps_the_hours_and_the_status(
 
     response = clock(client, "out", job_id, a.worker)
 
-    assert response.status_code == 200 and response.json()["ended_at"] is not None
+    assert response.status_code == 200
+    # Verify time entry was created with an end time
+    entries = time_entries(transactional_db, a.id, job_id)
+    assert len(entries) == 1 and entries[0].ended_at is not None
+    # Job status stays cancelled despite clock out
     assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.cancelled
 
 
@@ -534,7 +546,7 @@ def test_concurrent_clock_in_only_one_wins(db_file_based, file_company):
     with db_file_based() as db:
         job_id = on_shift_worker_job(db, file_company)
         db.commit()
-    url = f"/api/jobs/{job_id}/clock-in"
+    url = f"/api/me/jobs/{job_id}/start"
     responses = td.fire([("POST", url, {"headers": auth_header(file_company.worker)})] * 4)
     assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
     with db_file_based() as db:
@@ -551,7 +563,7 @@ def test_concurrent_clock_out_only_one_wins(db_file_based, file_company):
                 )
             )
             db.commit()
-    url = f"/api/jobs/{job_id}/clock-out"
+    url = f"/api/me/jobs/{job_id}/complete"
     responses = td.fire([("POST", url, {"headers": auth_header(file_company.worker)})] * 4)
     assert sorted(r.status_code for r in responses) == [200, 409, 409, 409]
 
