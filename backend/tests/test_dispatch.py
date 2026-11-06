@@ -996,10 +996,10 @@ def test_concurrent_transitions_after_accept_are_rejected(db_file_based, file_co
                {"headers": auth_header(w1)})])
     assert r[0].status_code == 200
 
-    # Try to transition back to draft (should fail: assigned is terminal or only -> cancelled)
+    # Try to transition to draft (should fail: draft is not a valid target status)
     r = fire([("PATCH", f"/api/jobs/{job_id}", {"json": {"version": 3, "status": "draft"},
                                                 "headers": auth_header(file_company.dispatcher)})])
-    assert r[0].status_code == 400
+    assert r[0].status_code == 422
 
 
 @pytest.mark.parametrize("attempt", range(3))

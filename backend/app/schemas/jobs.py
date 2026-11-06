@@ -55,7 +55,7 @@ class JobUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: Version
-    status: Literal["dispatching", "cancelled", "draft", "in_progress", "completed"] | None = None
+    status: Literal["dispatching", "cancelled", "in_progress", "completed"] | None = None
     title: Title | None = None
     description: Description | None = None
     trade: Trade | None = None
