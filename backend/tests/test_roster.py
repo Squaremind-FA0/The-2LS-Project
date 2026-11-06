@@ -7,8 +7,9 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
-from app.models import Job, JobOffer, JobStatus, Shift, TimeEntry
+from app.models import Job, JobOffer, JobStatus, Shift, ShiftStatus, TimeEntry
 from app.models.job import utcnow
+from app.roster import queries
 from app.services import dispatch
 from app.services import time_entries as entries_service
 from tests import test_dispatch as td
@@ -35,6 +36,30 @@ def post_shift(client, worker, start: datetime, end: datetime):
         json={"starts_at": iso(start), "ends_at": iso(end)},
         headers=auth_header(worker),
     )
+
+
+def post_roster_shift(client, actor, worker_id, start: datetime, end: datetime, notes=None):
+    body = {"worker_id": worker_id, "starts_at": iso(start), "ends_at": iso(end)}
+    if notes is not None:
+        body["notes"] = notes
+    return client.post("/api/roster/shifts", json=body, headers=auth_header(actor))
+
+
+def patch_roster_shift(client, actor, shift_id, **fields):
+    return client.patch(
+        f"/api/roster/shifts/{shift_id}", json=fields, headers=auth_header(actor)
+    )
+
+
+def delete_roster_shift(client, actor, shift_id):
+    return client.delete(f"/api/roster/shifts/{shift_id}", headers=auth_header(actor))
+
+
+def get_roster_week(client, actor, from_dt: datetime, to_dt: datetime, worker_id=None):
+    params = {"from": iso(from_dt), "to": iso(to_dt)}
+    if worker_id is not None:
+        params["worker_id"] = worker_id
+    return client.get("/api/roster", params=params, headers=auth_header(actor))
 
 
 # --- Phase 1: shift API and overlap guard (tasks 7-10) --------------------------------------
@@ -94,7 +119,7 @@ def test_shift_response_and_stored_owner_come_from_the_token(
     body = response.json()
     assert response.status_code == 201
     assert body["worker_id"] == a.worker.id
-    assert set(body) == {"id", "worker_id", "starts_at", "ends_at", "created_at"}
+    assert set(body) == {"id", "worker_id", "starts_at", "ends_at", "notes", "status", "created_at"}
     with tenant_context(transactional_db, a.id):
         shift = transactional_db.scalars(select(Shift)).one()
         assert (shift.company_id, shift.worker_id) == (a.id, a.worker.id)
@@ -163,6 +188,23 @@ def test_concurrent_overlapping_shifts_only_one_wins(db_file_based, file_company
         [("POST", "/api/shifts", {"json": body, "headers": auth_header(file_company.worker)})] * 4
     )
     assert sorted(r.status_code for r in responses) == [201, 409, 409, 409]
+
+
+def test_cancelled_shift_does_not_block_a_new_overlapping_shift(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    created = post_shift(client, a.worker, BASE, BASE + hours(8))
+    assert created.status_code == 201
+    with tenant_context(transactional_db, a.id):
+        shift = transactional_db.get(Shift, created.json()["id"])
+        shift.status = ShiftStatus.cancelled
+        transactional_db.commit()
+
+    response = post_shift(client, a.worker, BASE, BASE + hours(8))
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "scheduled"
 
 
 # --- Phase 2: on-shift dispatch filter (tasks 11-12) ----------------------------------------
@@ -536,3 +578,227 @@ def test_e2e_shift_offer_accept_clock_in_and_out(client, two_companies, transact
 
     assert td.fresh(transactional_db, a.id, Job, job_id).status is JobStatus.completed
     assert time_entries(transactional_db, a.id, job_id)[0].ended_at is not None
+
+
+# --- Phase 4: M5 — is_on_shift pure function (not wired into the matcher) -------------------
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected"),
+    [
+        (-1, 1, True),  # covers now
+        (0, 1, True),  # starts_at is inclusive
+        (-1, 0, False),  # ends_at is exclusive
+        (-3, -1, False),  # already over
+        (1, 3, False),  # not started
+    ],
+)
+def test_is_on_shift_true_inside_window_false_outside_at_the_edges(
+    transactional_db, two_companies, start, end, expected
+):
+    a, _ = two_companies
+    now = utcnow()
+    worker = td.add_worker(transactional_db, a.id, "edge", on_shift=False)
+    td.add_shift(transactional_db, a.id, worker.id, start=now + hours(start), end=now + hours(end))
+
+    with tenant_context(transactional_db, a.id):
+        assert queries.is_on_shift(transactional_db, worker.id, now) is expected
+
+
+def test_is_on_shift_ignores_a_cancelled_shift(transactional_db, two_companies):
+    a, _ = two_companies
+    now = utcnow()
+    worker = td.add_worker(transactional_db, a.id, "stale", on_shift=False)
+    td.add_shift(transactional_db, a.id, worker.id, start=now - hours(1), end=now + hours(1))
+
+    with tenant_context(transactional_db, a.id):
+        shift = transactional_db.scalars(select(Shift).where(Shift.worker_id == worker.id)).one()
+        shift.status = ShiftStatus.cancelled
+        transactional_db.flush()
+
+        assert queries.is_on_shift(transactional_db, worker.id, now) is False
+
+
+# --- Phase 5: M5 — admin/dispatcher roster CRUD at /api/roster/shifts -----------------------
+
+
+def test_admin_creates_a_shift_for_a_worker(client, two_companies):
+    a, _ = two_companies
+    response = post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8), notes="cover")
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["worker_id"] == a.worker.id
+    assert body["notes"] == "cover"
+    assert body["status"] == "scheduled"
+
+
+@pytest.mark.parametrize("role", ["admin", "dispatcher"])
+def test_dispatcher_and_admin_can_create_get_update_and_delete_a_shift(
+    client, two_companies, role
+):
+    a, _ = two_companies
+    actor = getattr(a, role)
+    created = post_roster_shift(client, actor, a.worker.id, BASE, BASE + hours(8))
+    assert created.status_code == 201
+    shift_id = created.json()["id"]
+
+    got = client.get(f"/api/roster/shifts/{shift_id}", headers=auth_header(actor))
+    assert got.status_code == 200
+    assert got.json()["id"] == shift_id
+
+    updated = patch_roster_shift(client, actor, shift_id, notes="updated")
+    assert updated.status_code == 200
+    assert updated.json()["notes"] == "updated"
+
+    deleted = delete_roster_shift(client, actor, shift_id)
+    assert deleted.status_code == 204
+    assert client.get(
+        f"/api/roster/shifts/{shift_id}", headers=auth_header(actor)
+    ).status_code == 404
+
+
+def test_admin_shift_create_overlap_rejected_with_409(client, two_companies):
+    a, _ = two_companies
+    assert post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8)).status_code == 201
+
+    response = post_roster_shift(client, a.admin, a.worker.id, BASE + hours(2), BASE + hours(4))
+
+    assert response.status_code == 409
+
+
+def test_admin_shift_create_touching_boundary_allowed(client, two_companies):
+    a, _ = two_companies
+    assert post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8)).status_code == 201
+    assert post_roster_shift(
+        client, a.admin, a.worker.id, BASE + hours(8), BASE + hours(16)
+    ).status_code == 201
+
+
+def test_admin_create_for_a_cross_company_worker_is_404(client, two_companies):
+    a, b = two_companies
+    response = post_roster_shift(client, a.admin, b.worker.id, BASE, BASE + hours(8))
+    assert response.status_code == 404
+
+
+def test_admin_update_excludes_itself_from_its_own_overlap_check(client, two_companies):
+    a, _ = two_companies
+    created = post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8))
+    shift_id = created.json()["id"]
+
+    response = patch_roster_shift(client, a.admin, shift_id, ends_at=iso(BASE + hours(9)))
+
+    assert response.status_code == 200
+    assert response.json()["ends_at"] == iso(BASE + hours(9))
+
+
+def test_patch_still_rejects_overlap_with_a_different_shift(client, two_companies):
+    a, _ = two_companies
+    post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8))
+    other = post_roster_shift(client, a.admin, a.worker.id, BASE + hours(8), BASE + hours(16))
+    other_id = other.json()["id"]
+
+    response = patch_roster_shift(client, a.admin, other_id, starts_at=iso(BASE + hours(2)))
+
+    assert response.status_code == 409
+
+
+def test_cancelling_a_shift_via_patch_then_frees_the_slot(client, two_companies):
+    a, _ = two_companies
+    created = post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8))
+    shift_id = created.json()["id"]
+
+    cancelled = patch_roster_shift(client, a.admin, shift_id, status="cancelled")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+    again = post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8))
+    assert again.status_code == 201
+
+
+def test_worker_role_is_403_on_every_roster_admin_route(client, two_companies):
+    a, _ = two_companies
+    headers = auth_header(a.worker)
+    shift_id = post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8)).json()["id"]
+
+    denied = post_roster_shift(client, a.worker, a.worker.id, BASE, BASE + hours(1))
+    assert denied.status_code == 403
+    assert client.get(f"/api/roster/shifts/{shift_id}", headers=headers).status_code == 403
+    assert client.patch(
+        f"/api/roster/shifts/{shift_id}", json={"notes": "x"}, headers=headers
+    ).status_code == 403
+    assert client.delete(f"/api/roster/shifts/{shift_id}", headers=headers).status_code == 403
+
+
+# --- Phase 6: M5 — GET /api/roster week view ------------------------------------------------
+
+
+def test_roster_week_view_returns_shifts_overlapping_the_range_across_workers(
+    client, two_companies, transactional_db
+):
+    a, _ = two_companies
+    colleague = td.add_worker(transactional_db, a.id, "colleague")
+    assert post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8)).status_code == 201
+    assert post_roster_shift(
+        client, a.admin, colleague.id, BASE + hours(10), BASE + hours(18)
+    ).status_code == 201
+    assert post_roster_shift(
+        client, a.admin, a.worker.id, BASE + hours(100), BASE + hours(108)
+    ).status_code == 201
+
+    response = get_roster_week(client, a.admin, BASE, BASE + hours(24))
+
+    assert response.status_code == 200
+    assert {s["worker_id"] for s in response.json()} == {a.worker.id, colleague.id}
+
+
+def test_roster_week_view_can_filter_by_worker_id(client, two_companies, transactional_db):
+    a, _ = two_companies
+    colleague = td.add_worker(transactional_db, a.id, "colleague")
+    post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8))
+    post_roster_shift(client, a.admin, colleague.id, BASE, BASE + hours(8))
+
+    response = get_roster_week(client, a.admin, BASE, BASE + hours(24), worker_id=colleague.id)
+
+    assert response.status_code == 200
+    assert {s["worker_id"] for s in response.json()} == {colleague.id}
+
+
+def test_roster_week_view_is_company_scoped(client, two_companies):
+    a, b = two_companies
+    post_roster_shift(client, a.admin, a.worker.id, BASE, BASE + hours(8))
+    post_roster_shift(client, b.admin, b.worker.id, BASE, BASE + hours(8))
+
+    response = get_roster_week(client, a.admin, BASE, BASE + hours(24))
+
+    assert response.status_code == 200
+    assert {s["worker_id"] for s in response.json()} == {a.worker.id}
+
+
+@pytest.mark.parametrize("role", ["worker"])
+def test_roster_week_view_requires_admin_or_dispatcher_role(client, two_companies, role):
+    a, _ = two_companies
+    response = get_roster_week(client, getattr(a, role), BASE, BASE + hours(24))
+    assert response.status_code == 403
+
+
+# --- Phase 7: M5 — GET /api/me/shifts worker alias ------------------------------------------
+
+
+def test_worker_reads_only_own_shifts_at_me_shifts(client, two_companies, transactional_db):
+    a, _ = two_companies
+    colleague = td.add_worker(transactional_db, a.id, "colleague")
+    assert post_shift(client, a.worker, BASE, BASE + hours(8)).status_code == 201
+    post_roster_shift(client, a.admin, colleague.id, BASE, BASE + hours(8))
+
+    response = client.get("/api/me/shifts", headers=auth_header(a.worker))
+
+    assert response.status_code == 200
+    assert {s["worker_id"] for s in response.json()} == {a.worker.id}
+
+
+@pytest.mark.parametrize("role", ["admin", "dispatcher"])
+def test_me_shifts_is_403_for_admin_and_dispatcher(client, two_companies, role):
+    a, _ = two_companies
+    response = client.get("/api/me/shifts", headers=auth_header(getattr(a, role)))
+    assert response.status_code == 403

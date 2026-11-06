@@ -8,11 +8,13 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Shift, User
+from app.models import Shift, ShiftStatus, User
 from app.services.dispatch import BadRequest, Conflict
 
 
-def create_shift(db: Session, worker_id: int, starts_at: datetime, ends_at: datetime) -> Shift:
+def create_shift(
+    db: Session, worker_id: int, starts_at: datetime, ends_at: datetime, notes: str | None = None
+) -> Shift:
     if starts_at >= ends_at:
         raise BadRequest("starts_at must be before ends_at")
 
@@ -22,7 +24,12 @@ def create_shift(db: Session, worker_id: int, starts_at: datetime, ends_at: date
     db.execute(select(User.id).where(User.id == worker_id).with_for_update())
     overlapping = db.scalar(
         select(Shift.id)
-        .where(Shift.worker_id == worker_id, starts_at < Shift.ends_at, ends_at > Shift.starts_at)
+        .where(
+            Shift.worker_id == worker_id,
+            Shift.status == ShiftStatus.scheduled,
+            starts_at < Shift.ends_at,
+            ends_at > Shift.starts_at,
+        )
         .limit(1)
     )
     if overlapping is not None:
@@ -30,7 +37,7 @@ def create_shift(db: Session, worker_id: int, starts_at: datetime, ends_at: date
             "Shift overlaps existing shift for this worker "
             "(new.starts_at < existing.ends_at AND new.ends_at > existing.starts_at)"
         )
-    shift = Shift(worker_id=worker_id, starts_at=starts_at, ends_at=ends_at)
+    shift = Shift(worker_id=worker_id, starts_at=starts_at, ends_at=ends_at, notes=notes)
     db.add(shift)
     db.commit()
     return shift

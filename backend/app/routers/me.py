@@ -10,8 +10,10 @@ from app.schemas.jobs import (
     WorkerLocationOut,
     WorkerLocationUpdate,
 )
+from app.schemas.shifts import ShiftResponse
 from app.schemas.users import MeResponse, WorkerProfileOut
 from app.services import dispatch, time_entries, workers
+from app.services import shifts as shifts_service
 
 router = APIRouter(prefix="/api", tags=["me"])
 
@@ -68,6 +70,17 @@ def list_my_jobs(
 ) -> list[JobOut]:
     jobs = dispatch.list_worker_jobs(db, user.id, limit=limit, offset=offset)
     return [JobOut.model_validate(job) for job in jobs]
+
+
+@router.get("/me/shifts", response_model=list[ShiftResponse])
+def list_my_shifts(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(_worker),
+    db: Session = Depends(get_tenant_db),
+) -> list[ShiftResponse]:
+    shifts = shifts_service.list_shifts(db, user.id, limit=limit, offset=offset)
+    return [ShiftResponse.model_validate(shift) for shift in shifts]
 
 
 def _own_job(db: Session, job_id: int, worker_id: int):

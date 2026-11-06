@@ -10,7 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.exc import IntegrityError
 
 BACKEND = Path(__file__).resolve().parents[1]
 TABLES = {"companies", "users", "worker_profiles"}
@@ -259,6 +261,52 @@ def test_0005_migrates_real_rows_both_ways(tmp_path):
             {"title", "description", "created_by", "version"}
         )
         assert _rows(engine, "SELECT job_id, worker_id FROM job_offers") == [(1, 7)]
+
+        _alembic(db_url, "upgrade", "head")
+        _alembic(db_url, "check")
+    finally:
+        engine.dispose()
+
+
+def test_0006_adds_shift_status_and_notes_and_downgrades_to_0005(tmp_path):
+    db_url = f"sqlite:///{tmp_path / 'm5.db'}"
+    engine = create_engine(db_url)
+    try:
+        _alembic(db_url, "upgrade", "head")
+        insp = inspect(engine)
+        cols = {c["name"] for c in insp.get_columns("shifts")}
+        assert {"notes", "status"} <= cols
+        checks = {c["name"] for c in insp.get_check_constraints("shifts")}
+        assert "ck_shifts_ends_after_starts" in checks
+
+        _sql(
+            engine,
+            "INSERT INTO companies (id, name, created_at) VALUES (1, 'Co', '2026-01-01 00:00:00')",
+            "INSERT INTO users (id, company_id, email, password_hash, full_name, role, is_active,"
+            " token_version, created_at) VALUES (7, 1, 'w@co.test', 'x', 'W', 'worker', 1, 0,"
+            " '2026-01-01 00:00:00')",
+            "INSERT INTO shifts (id, company_id, worker_id, starts_at, ends_at, created_at,"
+            " updated_at) VALUES (1, 1, 7, '2026-01-01 09:00:00', '2026-01-01 17:00:00',"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+        )
+        assert _rows(engine, "SELECT notes, status FROM shifts WHERE id = 1") == [
+            (None, "scheduled")
+        ]
+
+        with engine.begin() as conn, pytest.raises(IntegrityError):
+            conn.exec_driver_sql(
+                "INSERT INTO shifts (id, company_id, worker_id, starts_at, ends_at, created_at,"
+                " updated_at) VALUES (2, 1, 7, '2026-01-01 17:00:00', '2026-01-01 09:00:00',"
+                " '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+            )
+
+        _alembic(db_url, "check")
+
+        _alembic(db_url, "downgrade", "0005")
+        engine.dispose()
+        remaining = {c["name"] for c in inspect(engine).get_columns("shifts")}
+        assert not {"notes", "status"} & remaining
+        assert _rows(engine, "SELECT id FROM shifts WHERE id = 1") == [(1,)]
 
         _alembic(db_url, "upgrade", "head")
         _alembic(db_url, "check")

@@ -6,7 +6,7 @@ from app.models.job_event import JobEvent
 from app.models.job_offer import JobOffer, OfferStatus
 from app.models.payline import PayLine
 from app.models.payrun import PayRun, PayRunStatus
-from app.models.shift import Shift
+from app.models.shift import Shift, ShiftStatus
 from app.models.tenant import Role, TenantScoped
 from app.models.time_entry import TimeEntry
 from app.models.user import User
@@ -27,6 +27,7 @@ __all__ = [
     "PayRunStatus",
     "Role",
     "Shift",
+    "ShiftStatus",
     "TenantScoped",
     "TimeEntry",
     "User",

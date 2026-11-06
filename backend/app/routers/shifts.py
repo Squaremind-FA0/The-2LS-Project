@@ -18,7 +18,7 @@ def create_shift(
     payload: ShiftCreate, user: User = Depends(_worker), db: Session = Depends(get_tenant_db)
 ) -> ShiftResponse:
     try:
-        shift = service.create_shift(db, user.id, payload.starts_at, payload.ends_at)
+        shift = service.create_shift(db, user.id, payload.starts_at, payload.ends_at, payload.notes)
     except DispatchError as exc:
         raise_http(exc)
     return ShiftResponse.model_validate(shift)

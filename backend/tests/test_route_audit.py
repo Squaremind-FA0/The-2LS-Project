@@ -143,6 +143,10 @@ def test_audit_actually_sees_the_api_routes():
         "/api/payruns/{payrun_id}",
         "/api/payruns/{payrun_id}/paylines",
         "/api/payruns/{payrun_id}/export",
+        "/api/roster",
+        "/api/roster/shifts",
+        "/api/roster/shifts/{shift_id}",
+        "/api/me/shifts",
     } <= guarded
 
 
@@ -217,6 +221,12 @@ def test_roster_and_payroll_routes_require_the_prp_roles():
         ("PATCH", "/api/payruns/{payrun_id}"): {"company_admin"},
         ("GET", "/api/payruns/{payrun_id}/paylines"): {"worker"},
         ("GET", "/api/payruns/{payrun_id}/export"): {"company_admin"},
+        ("POST", "/api/roster/shifts"): {"dispatcher", "company_admin"},
+        ("GET", "/api/roster/shifts/{shift_id}"): {"dispatcher", "company_admin"},
+        ("PATCH", "/api/roster/shifts/{shift_id}"): {"dispatcher", "company_admin"},
+        ("DELETE", "/api/roster/shifts/{shift_id}"): {"dispatcher", "company_admin"},
+        ("GET", "/api/roster"): {"dispatcher", "company_admin"},
+        ("GET", "/api/me/shifts"): {"worker"},
     }
     actual = {
         (method, route.path): _roles(route)
